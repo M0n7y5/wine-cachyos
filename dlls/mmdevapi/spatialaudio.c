@@ -45,18 +45,31 @@ WINE_DEFAULT_DEBUG_CHANNEL(mmdevapi);
 
 #define SPATIAL_MAX_DYNAMIC_OBJECTS 112  /* matches Windows Sonic for Headphones */
 
+static BOOL spatial_option_enabled(const WCHAR *value)
+{
+    return *value == 'y' || *value == 'Y' || *value == 't' || *value == 'T' || *value == '1';
+}
+
 static UINT get_spatial_dynamic_budget(void)
 {
     WCHAR buf[16];
     DWORD size = sizeof(buf);
     HKEY key;
     BOOL enabled = FALSE;
+    const char *source = "registry";
 
-    if(RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Wine\\mmdevapi", &key) == ERROR_SUCCESS){
+    if(GetEnvironmentVariableW(L"WINE_SPATIAL_SOUND", buf, ARRAY_SIZE(buf))){
+        enabled = spatial_option_enabled(buf);
+        source = "environment";
+    }else if(RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Wine\\mmdevapi", &key) == ERROR_SUCCESS){
         if(RegQueryValueExW(key, L"SpatialSound", 0, NULL, (BYTE*)buf, &size) == ERROR_SUCCESS)
-            enabled = buf[0] == 'y' || buf[0] == 'Y' || buf[0] == 't' || buf[0] == 'T' || buf[0] == '1';
+            enabled = spatial_option_enabled(buf);
         RegCloseKey(key);
     }
+
+    TRACE("Spatial sound %s (%s), dynamic object budget %u.\n",
+            enabled ? "enabled" : "disabled", source,
+            enabled ? SPATIAL_MAX_DYNAMIC_OBJECTS : 0);
 
     return enabled ? SPATIAL_MAX_DYNAMIC_OBJECTS : 0;
 }
