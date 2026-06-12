@@ -73,7 +73,7 @@ static void test_formats(void)
 
     format.nBlockAlign *= 2;
     hr = ISpatialAudioClient_IsAudioObjectFormatSupported(sac, &format);
-    todo_wine ok(hr == S_OK, "Got %#lx.\n", hr);
+    ok(hr == S_OK, "Got %#lx.\n", hr);
 
     memcpy(&format, fmt, sizeof(format));
     format.wBitsPerSample *= 2;

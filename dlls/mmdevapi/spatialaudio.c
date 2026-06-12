@@ -74,9 +74,13 @@ static const char *debugstr_fmtex(const WAVEFORMATEX *fmt)
     return buf;
 }
 
-static BOOL formats_equal(const WAVEFORMATEX *fmt1, const WAVEFORMATEX *fmt2)
+static BOOL object_formats_compatible(const WAVEFORMATEX *fmt1, const WAVEFORMATEX *fmt2)
 {
-    return !memcmp(fmt1, fmt2, sizeof(*fmt1)) && !memcmp(fmt1 + 1, fmt2 + 1, fmt1->cbSize);
+    /* packing fields (nBlockAlign, nAvgBytesPerSec, cbSize) are not validated by Windows */
+    return fmt1->wFormatTag == fmt2->wFormatTag &&
+           fmt1->nChannels == fmt2->nChannels &&
+           fmt1->nSamplesPerSec == fmt2->nSamplesPerSec &&
+           fmt1->wBitsPerSample == fmt2->wBitsPerSample;
 }
 
 typedef struct SpatialAudioImpl SpatialAudioImpl;
@@ -653,7 +657,7 @@ static HRESULT WINAPI SAC_IsAudioObjectFormatSupported(ISpatialAudioClient *ifac
     if (!format)
         return E_POINTER;
 
-    if (!formats_equal(&sac->object_fmtex.Format, format))
+    if (!object_formats_compatible(&sac->object_fmtex.Format, format))
     {
         FIXME("Reporting format %s as unsupported.\n", debugstr_fmtex(format));
         return E_INVALIDARG;
@@ -806,7 +810,7 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
             return E_INVALIDARG;
         }
 
-        if(!(params->ObjectFormat && formats_equal(params->ObjectFormat, &This->object_fmtex.Format))) {
+        if(!(params->ObjectFormat && object_formats_compatible(params->ObjectFormat, &This->object_fmtex.Format))) {
             *stream = NULL;
             return AUDCLNT_E_UNSUPPORTED_FORMAT;
         }
