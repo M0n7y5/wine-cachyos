@@ -97,6 +97,9 @@ struct SpatialAudioObjectImpl {
 
     float *buf;
 
+    BOOL invalidated;
+    BOOL updated;
+
     struct list entry;
 };
 
@@ -213,6 +216,15 @@ static HRESULT WINAPI SAO_GetBuffer(ISpatialAudioObject *iface,
         return SPTLAUDCLNT_E_OUT_OF_ORDER;
     }
 
+    if(This->invalidated){
+        *buffer = NULL;
+        *bytes = 0;
+        LeaveCriticalSection(&This->sa_stream->lock);
+        return SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+    }
+
+    This->updated = TRUE;
+
     *buffer = (BYTE *)This->buf;
     *bytes = This->sa_stream->update_frames *
         This->sa_stream->sa_client->object_fmtex.Format.nBlockAlign;
@@ -225,15 +237,34 @@ static HRESULT WINAPI SAO_GetBuffer(ISpatialAudioObject *iface,
 static HRESULT WINAPI SAO_SetEndOfStream(ISpatialAudioObject *iface, UINT32 frames)
 {
     SpatialAudioObjectImpl *This = impl_from_ISpatialAudioObject(iface);
-    FIXME("(%p)->(%u)\n", This, frames);
-    return E_NOTIMPL;
+
+    TRACE("(%p)->(%u)\n", This, frames);
+
+    EnterCriticalSection(&This->sa_stream->lock);
+
+    if(This->sa_stream->update_frames == ~0){
+        LeaveCriticalSection(&This->sa_stream->lock);
+        return SPTLAUDCLNT_E_OUT_OF_ORDER;
+    }
+
+    This->invalidated = TRUE;
+
+    LeaveCriticalSection(&This->sa_stream->lock);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI SAO_IsActive(ISpatialAudioObject *iface, BOOL *active)
 {
     SpatialAudioObjectImpl *This = impl_from_ISpatialAudioObject(iface);
-    FIXME("(%p)->(%p)\n", This, active);
-    return E_NOTIMPL;
+
+    TRACE("(%p)->(%p)\n", This, active);
+
+    EnterCriticalSection(&This->sa_stream->lock);
+    *active = !This->invalidated;
+    LeaveCriticalSection(&This->sa_stream->lock);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI SAO_GetAudioObjectType(ISpatialAudioObject *iface,
@@ -423,6 +454,7 @@ static HRESULT WINAPI SAORS_BeginUpdatingAudioObjects(ISpatialAudioObjectRenderS
 
         LIST_FOR_EACH_ENTRY(object, &This->objects, SpatialAudioObjectImpl, entry){
             memset(object->buf, 0, This->update_frames * This->sa_client->object_fmtex.Format.nBlockAlign);
+            object->updated = FALSE;
         }
     }else if (!fixme_once){
         fixme_once = TRUE;
@@ -471,10 +503,18 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
 
     if(This->update_frames > 0){
         LIST_FOR_EACH_ENTRY(object, &This->objects, SpatialAudioObjectImpl, entry){
+            if(object->invalidated)
+                continue;
             if(object->type != AudioObjectType_Dynamic)
                 mix_static_object(This, object);
             else
                 WARN("Don't know how to mix dynamic object yet. %p\n", object);
+        }
+
+        /* an object that misses an update cycle is invalidated */
+        LIST_FOR_EACH_ENTRY(object, &This->objects, SpatialAudioObjectImpl, entry){
+            if(!object->updated)
+                object->invalidated = TRUE;
         }
 
         hr = IAudioRenderClient_ReleaseBuffer(This->render, This->update_frames, 0);
