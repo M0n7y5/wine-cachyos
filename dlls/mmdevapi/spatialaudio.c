@@ -39,6 +39,24 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(mmdevapi);
 
+#define SPATIAL_MAX_DYNAMIC_OBJECTS 112  /* matches Windows Sonic for Headphones */
+
+static UINT get_spatial_dynamic_budget(void)
+{
+    WCHAR buf[16];
+    DWORD size = sizeof(buf);
+    HKEY key;
+    BOOL enabled = FALSE;
+
+    if(RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Wine\\mmdevapi", &key) == ERROR_SUCCESS){
+        if(RegQueryValueExW(key, L"SpatialSound", 0, NULL, (BYTE*)buf, &size) == ERROR_SUCCESS)
+            enabled = buf[0] == 'y' || buf[0] == 'Y' || buf[0] == 't' || buf[0] == 'T' || buf[0] == '1';
+        RegCloseKey(key);
+    }
+
+    return enabled ? SPATIAL_MAX_DYNAMIC_OBJECTS : 0;
+}
+
 static UINT32 AudioObjectType_to_index(AudioObjectType type)
 {
     UINT32 o = 0;
@@ -130,6 +148,7 @@ struct SpatialAudioImpl {
     IMMDevice *mmdev;
     LONG ref;
     WAVEFORMATEXTENSIBLE object_fmtex;
+    UINT dyn_budget;
 };
 
 static inline SpatialAudioObjectImpl *impl_from_ISpatialAudioObject(ISpatialAudioObject *iface)
@@ -652,9 +671,10 @@ static HRESULT WINAPI SAC_GetMaxDynamicObjectCount(ISpatialAudioClient *iface,
         UINT32 *value)
 {
     SpatialAudioImpl *This = impl_from_ISpatialAudioClient(iface);
-    FIXME("(%p)->(%p)\n", This, value);
 
-    *value = 0;
+    TRACE("(%p)->(%p)\n", This, value);
+
+    *value = This->dyn_budget;
 
     return S_OK;
 }
@@ -990,6 +1010,7 @@ HRESULT SpatialAudioClient_Create(IMMDevice *mmdev, ISpatialAudioClient **out)
     obj->ref = 1;
     obj->ISpatialAudioClient_iface.lpVtbl = &ISpatialAudioClient_vtbl;
     obj->IAudioFormatEnumerator_iface.lpVtbl = &IAudioFormatEnumerator_vtbl;
+    obj->dyn_budget = get_spatial_dynamic_budget();
 
     obj->object_fmtex.Format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
     obj->object_fmtex.Format.nChannels = 1;
