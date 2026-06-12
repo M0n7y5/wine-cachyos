@@ -111,13 +111,23 @@ static void phonon_load(void)
 {
     const char *path = getenv("WINE_SPATIAL_PHONON");
 
-    phonon_handle = dlopen(path && path[0] ? path : "libphonon.so", RTLD_NOW);
+    if (path && path[0])
+    {
+        if (!(phonon_handle = dlopen(path, RTLD_NOW)))
+            /* the override may name the wrong ELF class in a split wow64 setup */
+            WARN("Could not load %s: %s\n", path, dlerror());
+        else
+            TRACE("Loaded %s.\n", path);
+    }
     if (!phonon_handle)
     {
-        WARN("Could not load %s: %s\n", path && path[0] ? path : "libphonon.so", dlerror());
-        return;
+        if (!(phonon_handle = dlopen("libphonon.so", RTLD_NOW)))
+        {
+            WARN("Could not load libphonon.so: %s\n", dlerror());
+            return;
+        }
+        TRACE("Loaded libphonon.so.\n");
     }
-    TRACE("Loaded %s.\n", path && path[0] ? path : "libphonon.so");
 
 #define LOAD_FUNC(f) \
     if (!(p_##f = dlsym(phonon_handle, #f))) goto fail
