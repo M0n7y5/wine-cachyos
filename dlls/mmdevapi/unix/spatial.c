@@ -114,9 +114,10 @@ static void phonon_load(void)
     phonon_handle = dlopen(path && path[0] ? path : "libphonon.so", RTLD_NOW);
     if (!phonon_handle)
     {
-        WARN("Could not load libphonon.so: %s\n", dlerror());
+        WARN("Could not load %s: %s\n", path && path[0] ? path : "libphonon.so", dlerror());
         return;
     }
+    TRACE("Loaded %s.\n", path && path[0] ? path : "libphonon.so");
 
 #define LOAD_FUNC(f) \
     if (!(p_##f = dlsym(phonon_handle, #f))) goto fail

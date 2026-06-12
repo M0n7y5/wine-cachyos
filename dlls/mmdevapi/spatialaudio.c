@@ -681,8 +681,11 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
     TRACE("(%p)->(0x%x, %p)\n", This, type, object);
 
     if(type == AudioObjectType_Dynamic){
-        if(This->dyn_live >= This->dyn_max)
+        if(This->dyn_live >= This->dyn_max){
+            WARN("No dynamic object slots available (%u live, %u max, spatial sound %s).\n",
+                    This->dyn_live, This->dyn_max, This->sa_client->dyn_budget ? "on" : "off");
             return SPTLAUDCLNT_E_NO_MORE_OBJECTS;
+        }
     }else if(type & ~This->params.StaticObjectTypeMask){
         return SPTLAUDCLNT_E_STATIC_OBJECT_NOT_AVAILABLE;
     }else{
@@ -719,6 +722,8 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
             params.handle = This->engine;
             if(!WINE_UNIX_CALL(unix_spatial_object_add, &params))
                 obj->engine_slot = params.slot;
+            else
+                WARN("No HRTF effect slot for dynamic object %p, will use panning.\n", obj);
         }
     }
     list_add_tail(&This->objects, &obj->entry);
@@ -1021,6 +1026,8 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
         }
 
         if(params->MinDynamicObjectCount > This->dyn_budget){
+            WARN("MinDynamicObjectCount %u exceeds the budget of %u.\n",
+                    params->MinDynamicObjectCount, This->dyn_budget);
             *stream = NULL;
             return AUDCLNT_E_UNSUPPORTED_FORMAT;
         }
@@ -1079,8 +1086,10 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
             init_params.frames = obj->period_frames;
             init_params.handle = 0;
             if(!WINE_UNIX_CALL(unix_spatial_init, &init_params) &&
-                    (obj->hrtf_buf = calloc(2 * obj->period_frames, sizeof(float))))
+                    (obj->hrtf_buf = calloc(2 * obj->period_frames, sizeof(float)))){
                 obj->engine = init_params.handle;
+                TRACE("Using the Steam Audio HRTF engine, up to %u dynamic objects.\n", obj->dyn_max);
+            }
             else if(init_params.handle){
                 struct spatial_release_params release_params;
                 release_params.handle = init_params.handle;
