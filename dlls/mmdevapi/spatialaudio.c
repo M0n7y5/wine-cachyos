@@ -635,6 +635,130 @@ static void mix_dynamic_object(SpatialAudioStreamImpl *stream, SpatialAudioObjec
     }
 }
 
+/* ----------------------------------------------------------------------
+ * Per-channel level stats for an external debug overlay.  Opt-in via the
+ * WINE_SPATIAL_STATS env var (a unix path); a dedicated writer thread emits a
+ * one-line snapshot so the audio thread never does file I/O.
+ * ---------------------------------------------------------------------- */
+
+static struct {
+    volatile LONG started;     /* 0 unstarted, 2 initializing, 1 running, -1 disabled */
+    volatile LONG seq;         /* bumped each update; the writer uses it for liveness */
+    WCHAR path[MAX_PATH];
+    float db[17];              /* per AudioObjectType_to_index dBFS */
+    BOOL present[17];
+    volatile LONG hrtf, bed, dyn_live, dyn_max;
+} spatial_stats;
+
+static const char *spatial_channel_name(UINT32 idx)
+{
+    static const char *const names[] = {
+        "FL", "FR", "FC", "LFE", "SL", "SR", "BL", "BR",
+        "TFL", "TFR", "TBL", "TBR", "BFL", "BFR", "BBL", "BBR", "BC" };
+    return idx < ARRAY_SIZE(names) ? names[idx] : "?";
+}
+
+static float spatial_channel_dbfs(const float *buf, UINT32 frames)
+{
+    double s = 0.0;
+    UINT32 i;
+    if(!frames) return -120.0f;
+    for(i = 0; i < frames; ++i) s += (double)buf[i] * buf[i];
+    s = sqrt(s / frames);
+    return s <= 1e-6 ? -120.0f : (float)(20.0 * log10(s));
+}
+
+static BOOL spatial_stats_dos_path(WCHAR *out, DWORD cch)
+{
+    WCHAR env[MAX_PATH];
+    DWORD i, n = GetEnvironmentVariableW(L"WINE_SPATIAL_STATS", env, ARRAY_SIZE(env));
+    if(!n || n >= ARRAY_SIZE(env)) return FALSE;
+    if(env[0] == '/'){                 /* unix path -> Z: drive (Z: maps to /) */
+        if(n + 3 >= cch) return FALSE;
+        out[0] = 'Z'; out[1] = ':';
+        for(i = 0; env[i]; ++i) out[i + 2] = env[i] == '/' ? '\\' : env[i];
+        out[i + 2] = 0;
+    }else
+        lstrcpynW(out, env, cch);
+    return TRUE;
+}
+
+static DWORD WINAPI spatial_stats_writer(void *arg)
+{
+    WCHAR tmp[MAX_PATH];
+    DWORD lastseq = ~0;
+    int idle = 0;
+
+    lstrcpynW(tmp, spatial_stats.path, ARRAY_SIZE(tmp) - 5);
+    lstrcatW(tmp, L".tmp");
+
+    for(;;){
+        char line[512];
+        HANDLE h;
+        DWORD wr;
+        int len, i;
+
+        Sleep(100);
+        if((DWORD)spatial_stats.seq == lastseq){ if(idle < 50) ++idle; }
+        else { idle = 0; lastseq = spatial_stats.seq; }
+
+        len = snprintf(line, sizeof(line), "hrtf:%ld bed:%ld dyn:%ld/%ld",
+                spatial_stats.hrtf, spatial_stats.bed,
+                spatial_stats.dyn_live, spatial_stats.dyn_max);
+        if(idle < 5){
+            for(i = 0; i < 17 && len < (int)sizeof(line) - 16; ++i)
+                if(spatial_stats.present[i])
+                    len += snprintf(line + len, sizeof(line) - len, " %s:%.1f",
+                            spatial_channel_name(i), spatial_stats.db[i]);
+        }else
+            len += snprintf(line + len, sizeof(line) - len, " idle");
+        if(len < (int)sizeof(line) - 1) line[len++] = '\n';
+
+        h = CreateFileW(tmp, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if(h != INVALID_HANDLE_VALUE){
+            WriteFile(h, line, len, &wr, NULL);
+            CloseHandle(h);
+            MoveFileExW(tmp, spatial_stats.path, MOVEFILE_REPLACE_EXISTING);
+        }
+    }
+    return 0;
+}
+
+static void spatial_stats_start(void)
+{
+    HANDLE t;
+    if(InterlockedCompareExchange(&spatial_stats.started, 2, 0) != 0) return;
+    if(spatial_stats_dos_path(spatial_stats.path, ARRAY_SIZE(spatial_stats.path)) &&
+            (t = CreateThread(NULL, 0, spatial_stats_writer, NULL, 0, NULL))){
+        CloseHandle(t);
+        TRACE("Writing spatial channel stats to %s\n", debugstr_w(spatial_stats.path));
+        InterlockedExchange(&spatial_stats.started, 1);
+    }else
+        InterlockedExchange(&spatial_stats.started, -1);
+}
+
+static void spatial_stats_update(SpatialAudioStreamImpl *stream)
+{
+    SpatialAudioObjectImpl *object;
+    int i;
+    if(spatial_stats.started != 1) return;
+    for(i = 0; i < 17; ++i) spatial_stats.present[i] = FALSE;
+    LIST_FOR_EACH_ENTRY(object, &stream->objects, SpatialAudioObjectImpl, entry){
+        if(object->invalidated || object->type == AudioObjectType_Dynamic ||
+                object->static_idx >= 17)
+            continue;
+        spatial_stats.db[object->static_idx] =
+                spatial_channel_dbfs(object->buf, stream->update_frames);
+        spatial_stats.present[object->static_idx] = TRUE;
+    }
+    spatial_stats.hrtf = stream->engine != 0;
+    spatial_stats.bed = stream->virtualize_bed;
+    spatial_stats.dyn_live = stream->dyn_live;
+    spatial_stats.dyn_max = stream->dyn_max;
+    InterlockedIncrement(&spatial_stats.seq);
+}
+
 static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStream *iface)
 {
     SpatialAudioStreamImpl *This = impl_from_ISpatialAudioObjectRenderStream(iface);
@@ -653,6 +777,8 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
     if(This->update_frames > 0){
         struct spatial_mix_object mix_objs[SPATIAL_MAX_MIX_OBJECTS];
         UINT32 mix_count = 0, i;
+
+        if(!spatial_stats.started) spatial_stats_start();
 
         LIST_FOR_EACH_ENTRY(object, &This->objects, SpatialAudioObjectImpl, entry){
             if(object->invalidated)
@@ -699,6 +825,7 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
                 }
             }
         }
+        spatial_stats_update(This);
 
         /* an object that misses an update cycle is invalidated */
         LIST_FOR_EACH_ENTRY(object, &This->objects, SpatialAudioObjectImpl, entry){
