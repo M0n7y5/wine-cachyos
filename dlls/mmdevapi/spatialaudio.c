@@ -810,8 +810,21 @@ static HRESULT WINAPI SAC_GetNativeStaticObjectTypeMask(ISpatialAudioClient *ifa
         AudioObjectType *mask)
 {
     SpatialAudioImpl *This = impl_from_ISpatialAudioClient(iface);
-    FIXME("(%p)->(%p)\n", This, mask);
-    return E_NOTIMPL;
+
+    TRACE("(%p)->(%p)\n", This, mask);
+
+    if(!This->dyn_budget)
+        return E_NOTIMPL;
+
+    /* Windows Sonic for Headphones advertises a 7.1 native bed regardless of the
+     * physical endpoint; height/Atmos channels arrive as dynamic objects, never as
+     * static bed channels, so AudioObjectType_Dynamic and the TOP_* bits are excluded. */
+    *mask = AudioObjectType_FrontLeft | AudioObjectType_FrontRight |
+            AudioObjectType_FrontCenter | AudioObjectType_LowFrequency |
+            AudioObjectType_SideLeft | AudioObjectType_SideRight |
+            AudioObjectType_BackLeft | AudioObjectType_BackRight;
+
+    return S_OK;
 }
 
 static HRESULT WINAPI SAC_GetMaxDynamicObjectCount(ISpatialAudioClient *iface,
@@ -877,8 +890,17 @@ static HRESULT WINAPI SAC_IsSpatialAudioStreamAvailable(ISpatialAudioClient *ifa
         REFIID stream_uuid, const PROPVARIANT *info)
 {
     SpatialAudioImpl *This = impl_from_ISpatialAudioClient(iface);
-    FIXME("(%p)->(%s, %p)\n", This, debugstr_guid(stream_uuid), info);
-    return E_NOTIMPL;
+
+    TRACE("(%p)->(%s, %p)\n", This, debugstr_guid(stream_uuid), info);
+
+    if(!This->dyn_budget)
+        return E_NOTIMPL;
+
+    if(IsEqualIID(stream_uuid, &IID_ISpatialAudioObjectRenderStream))
+        return S_OK;
+
+    WARN("Unsupported spatial stream %s.\n", debugstr_guid(stream_uuid));
+    return SPTLAUDCLNT_E_STREAM_NOT_AVAILABLE;
 }
 
 static WAVEFORMATEX *clone_fmtex(const WAVEFORMATEX *src)
