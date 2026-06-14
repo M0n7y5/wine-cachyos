@@ -45,7 +45,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(mmdevapi);
 WINE_DECLARE_DEBUG_CHANNEL(spatial);
 
 #define SPATIAL_MAX_DYNAMIC_OBJECTS 112  /* matches Windows Sonic for Headphones */
-#define SPATIAL_MAX_MIX_OBJECTS (SPATIAL_MAX_DYNAMIC_OBJECTS + 13)  /* dynamic objects + up to 13 static bed channels */
+#define SPATIAL_MAX_MIX_OBJECTS (SPATIAL_MAX_DYNAMIC_OBJECTS + 16)  /* dynamic objects + up to 16 static bed channels */
 
 static BOOL spatial_option_enabled(const WCHAR *value)
 {
@@ -566,9 +566,10 @@ static HRESULT WINAPI SAORS_BeginUpdatingAudioObjects(ISpatialAudioObjectRenderS
     return S_OK;
 }
 
-/* canonical 7.1.4 bed directions in Steam Audio listener space (+x right, +y up,
- * -z ahead); returns FALSE for non-directional channels (LFE), which bypass the
- * HRTF and sum equally to both ears. */
+/* canonical 7.1.4 bed directions plus the bottom quad and back-center, in Steam
+ * Audio listener space (+x right, +y up, -z ahead); returns FALSE for the only
+ * non-directional channel (LFE), which bypasses the HRTF and sums equally to
+ * both ears. */
 static BOOL bed_object_position(AudioObjectType type, float pos[3])
 {
     switch(type){
@@ -583,6 +584,10 @@ static BOOL bed_object_position(AudioObjectType type, float pos[3])
     case AudioObjectType_TopFrontRight: pos[0]= 0.5f; pos[1]=0.707f; pos[2]=-0.5f;   return TRUE;
     case AudioObjectType_TopBackLeft:   pos[0]=-0.5f; pos[1]=0.707f; pos[2]= 0.5f;   return TRUE;
     case AudioObjectType_TopBackRight:  pos[0]= 0.5f; pos[1]=0.707f; pos[2]= 0.5f;   return TRUE;
+    case AudioObjectType_BottomFrontLeft:  pos[0]=-0.5f; pos[1]=-0.707f; pos[2]=-0.5f;  return TRUE;
+    case AudioObjectType_BottomFrontRight: pos[0]= 0.5f; pos[1]=-0.707f; pos[2]=-0.5f;  return TRUE;
+    case AudioObjectType_BottomBackLeft:   pos[0]=-0.5f; pos[1]=-0.707f; pos[2]= 0.5f;  return TRUE;
+    case AudioObjectType_BottomBackRight:  pos[0]= 0.5f; pos[1]=-0.707f; pos[2]= 0.5f;  return TRUE;
     case AudioObjectType_BackCenter:    pos[0]= 0.0f; pos[1]=0.0f;   pos[2]= 1.0f;   return TRUE;
     default:                            pos[0]= 0.0f; pos[1]=0.0f;   pos[2]= 0.0f;   return FALSE;
     }
@@ -1130,6 +1135,10 @@ static void static_mask_to_channels(AudioObjectType static_mask, WORD *count, DW
     CONVERT_MASK(AudioObjectType_TopFrontRight, SPEAKER_TOP_FRONT_RIGHT);
     CONVERT_MASK(AudioObjectType_TopBackLeft, SPEAKER_TOP_BACK_LEFT);
     CONVERT_MASK(AudioObjectType_TopBackRight, SPEAKER_TOP_BACK_RIGHT);
+    CONVERT_MASK(AudioObjectType_BottomFrontLeft, 0);
+    CONVERT_MASK(AudioObjectType_BottomFrontRight, 0);
+    CONVERT_MASK(AudioObjectType_BottomBackLeft, 0);
+    CONVERT_MASK(AudioObjectType_BottomBackRight, 0);
     CONVERT_MASK(AudioObjectType_BackCenter, SPEAKER_BACK_CENTER);
 }
 
