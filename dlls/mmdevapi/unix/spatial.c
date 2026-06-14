@@ -157,6 +157,10 @@ struct spatial_engine
     IPLAudioSettings audio;
     IPLBinauralEffect effects[SPATIAL_MAX_SLOTS];
     float *scratch;     /* 2 * frames, deinterleaved L then R */
+    int bass_on;        /* WINE_SPATIAL_BASS one-pole low-shelf active */
+    float bass_g;       /* LF gain, 0..1 (1 = unchanged) */
+    float bass_a;       /* one-pole coefficient = 2*pi*fc/fs */
+    float lp_l, lp_r;   /* lowpass state, persists across mix calls */
 };
 
 static NTSTATUS spatial_init(void *args)
@@ -195,6 +199,22 @@ static NTSTATUS spatial_init(void *args)
     {
         WARN("iplHRTFCreate failed.\n");
         goto fail;
+    }
+
+    {
+        const char *bass = getenv("WINE_SPATIAL_BASS");
+        const char *hz = getenv("WINE_SPATIAL_BASS_HZ");
+        float fc = hz && hz[0] ? (float)atof(hz) : 250.0f;
+        float g = bass && bass[0] ? (float)atof(bass) : 0.5f; /* default-on; WINE_SPATIAL_BASS=1 disables */
+
+        if (g < 0.0f) g = 0.0f;
+        if (g > 1.0f) g = 1.0f;
+        engine->bass_g = g;
+        engine->bass_a = 2.0f * 3.14159265358979f * fc / (float)params->rate;
+        if (engine->bass_a > 1.0f) engine->bass_a = 1.0f;
+        engine->bass_on = (g < 1.0f);
+        if (engine->bass_on)
+            TRACE("bass low-shelf on: LF gain %.2f, corner %.0f Hz.\n", g, fc);
     }
 
     TRACE("engine %p: %u Hz, %u frames.\n", engine, params->rate, params->frames);
@@ -317,6 +337,19 @@ static NTSTATUS spatial_mix(void *args)
         {
             out_l[f] += out_data[0][f] * objs[i].volume;
             out_r[f] += out_data[1][f] * objs[i].volume;
+        }
+    }
+
+    if (engine->bass_on)
+    {
+        float a = engine->bass_a, g1 = 1.0f - engine->bass_g;
+
+        for (f = 0; f < params->frames; f++)
+        {
+            engine->lp_l += a * (out_l[f] - engine->lp_l);
+            engine->lp_r += a * (out_r[f] - engine->lp_r);
+            out_l[f] -= g1 * engine->lp_l;
+            out_r[f] -= g1 * engine->lp_r;
         }
     }
 
