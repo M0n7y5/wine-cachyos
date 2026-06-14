@@ -978,8 +978,22 @@ static HRESULT WINAPI SAC_GetStaticObjectPosition(ISpatialAudioClient *iface,
         AudioObjectType type, float *x, float *y, float *z)
 {
     SpatialAudioImpl *This = impl_from_ISpatialAudioClient(iface);
-    FIXME("(%p)->(0x%x, %p, %p, %p)\n", This, type, x, y, z);
-    return E_NOTIMPL;
+    float pos[3];
+
+    TRACE("(%p)->(0x%x, %p, %p, %p)\n", This, type, x, y, z);
+
+    if(!This->dyn_budget)
+        return E_NOTIMPL;
+
+    /* Report the same canonical 7.1.4 directions the HRTF mixer renders each bed
+     * channel to, so a probing title reads back exactly where the channel sits;
+     * non-directional types (LFE) report the listener origin. */
+    bed_object_position(type, pos);
+    *x = pos[0];
+    *y = pos[1];
+    *z = pos[2];
+
+    return S_OK;
 }
 
 static HRESULT WINAPI SAC_GetNativeStaticObjectTypeMask(ISpatialAudioClient *iface,
