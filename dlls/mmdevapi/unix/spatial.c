@@ -39,7 +39,7 @@
 
 #include "unixlib.h"
 
-WINE_DEFAULT_DEBUG_CHANNEL(mmdevapi);
+WINE_DEFAULT_DEBUG_CHANNEL(spatial);
 
 /* Minimal Steam Audio 4.x C API declarations, from the documented interface
  * (github.com/ValveSoftware/steam-audio, Apache-2.0).  The library is
