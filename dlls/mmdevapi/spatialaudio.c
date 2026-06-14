@@ -42,6 +42,7 @@
 #include "unix/unixlib.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(mmdevapi);
+WINE_DECLARE_DEBUG_CHANNEL(spatial);
 
 #define SPATIAL_MAX_DYNAMIC_OBJECTS 112  /* matches Windows Sonic for Headphones */
 #define SPATIAL_MAX_MIX_OBJECTS (SPATIAL_MAX_DYNAMIC_OBJECTS + 13)  /* dynamic objects + up to 13 static bed channels */
@@ -68,7 +69,7 @@ static UINT get_spatial_dynamic_budget(void)
         RegCloseKey(key);
     }
 
-    TRACE("Spatial sound %s (%s), dynamic object budget %u.\n",
+    TRACE_(spatial)("Spatial sound %s (%s), dynamic object budget %u.\n",
             enabled ? "enabled" : "disabled", source,
             enabled ? SPATIAL_MAX_DYNAMIC_OBJECTS : 0);
 
@@ -485,6 +486,9 @@ static HRESULT WINAPI SAORS_Start(ISpatialAudioObjectRenderStream *iface)
         return hr;
     }
 
+    TRACE_(spatial)("stream %p started, rendering through %s.\n", This,
+            This->engine ? "the Steam Audio HRTF engine" :
+            (This->virtualize_bed ? "stereo panning (HRTF unavailable)" : "multichannel passthrough"));
     return S_OK;
 }
 
@@ -1223,6 +1227,10 @@ static HRESULT activate_stream(SpatialAudioStreamImpl *stream)
 
     stream->period_frames = MulDiv(period, stream->stream_fmtex.Format.nSamplesPerSec, 10000000);
 
+    TRACE_(spatial)("stream %p configured: %u-channel bed -> %u-channel endpoint, %s, static mask 0x%x, dynamic budget %u.\n",
+            stream, bed_ch, stream->stream_fmtex.Format.nChannels,
+            stream->virtualize_bed ? "HRTF bed virtualization" : "multichannel passthrough",
+            effective_mask, stream->dyn_max);
     return S_OK;
 }
 
@@ -1327,7 +1335,7 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
             if(!WINE_UNIX_CALL(unix_spatial_init, &init_params) &&
                     (obj->hrtf_buf = calloc(2 * obj->period_frames, sizeof(float)))){
                 obj->engine = init_params.handle;
-                TRACE("Using the Steam Audio HRTF engine (bed virtualization %s, up to %u dynamic objects).\n", obj->virtualize_bed ? "on" : "off", obj->dyn_max);
+                TRACE_(spatial)("Using the Steam Audio HRTF engine (bed virtualization %s, up to %u dynamic objects).\n", obj->virtualize_bed ? "on" : "off", obj->dyn_max);
             }
             else if(init_params.handle){
                 struct spatial_release_params release_params;
@@ -1335,7 +1343,7 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
                 WINE_UNIX_CALL(unix_spatial_release, &release_params);
             }
             if(!obj->engine)
-                WARN("HRTF engine unavailable, dynamic objects will use stereo panning.\n");
+                WARN_(spatial)("HRTF engine unavailable, dynamic objects will use stereo panning.\n");
         }
 
         *stream = &obj->ISpatialAudioObjectRenderStream_iface;
@@ -1481,5 +1489,7 @@ HRESULT SpatialAudioClient_Create(IMMDevice *mmdev, ISpatialAudioClient **out)
 
     *out = &obj->ISpatialAudioClient_iface;
 
+    TRACE_(spatial)("client %p created (spatial sound %s, dynamic object budget %u).\n",
+            obj, obj->dyn_budget ? "enabled" : "disabled", obj->dyn_budget);
     return S_OK;
 }
