@@ -154,11 +154,18 @@ static void (*p_mysofa_getfilter_float)(void *, float, float, float,
                                         float *, float *, float *, float *);
 static void (*p_mysofa_close)(void *);
 
-/* libmysofa is dlopen'd at runtime exactly like libphonon; mysofa.h is not
- * shipped, so MYSOFA_EASY is treated as an opaque void *. */
+/* libmysofa is dlopen'd at runtime exactly like libphonon: WINE_SPATIAL_MYSOFA
+ * overrides the path (e.g. a proton-bundled copy the container loader would not
+ * find by soname), else the bare soname.  mysofa.h is not shipped, so
+ * MYSOFA_EASY is treated as an opaque void *. */
 static void mysofa_load(void)
 {
-    if (!(mysofa_handle = dlopen("libmysofa.so", RTLD_NOW)) &&
+    const char *path = getenv("WINE_SPATIAL_MYSOFA");
+
+    if (path && path[0] && !(mysofa_handle = dlopen(path, RTLD_NOW)))
+        WARN("Could not load %s: %s\n", path, dlerror());
+    if (!mysofa_handle &&
+        !(mysofa_handle = dlopen("libmysofa.so", RTLD_NOW)) &&
         !(mysofa_handle = dlopen("libmysofa.so.1", RTLD_NOW)))
     {
         WARN("Could not load libmysofa: %s\n", dlerror());
