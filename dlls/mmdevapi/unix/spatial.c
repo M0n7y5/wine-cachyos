@@ -204,8 +204,10 @@ static NTSTATUS spatial_init(void *args)
     {
         const char *bass = getenv("WINE_SPATIAL_BASS");
         const char *hz = getenv("WINE_SPATIAL_BASS_HZ");
-        float fc = hz && hz[0] ? (float)atof(hz) : 250.0f;
-        float g = bass && bass[0] ? (float)atof(bass) : 0.5f; /* default-on; WINE_SPATIAL_BASS=1 disables */
+        /* defaults calibrated to the measured correlated-bed bass buildup: a
+         * flat ~+5 dB plateau below ~140 Hz that rolls off to 0 by ~1 kHz */
+        float fc = hz && hz[0] ? (float)atof(hz) : 500.0f;
+        float g = bass && bass[0] ? (float)atof(bass) : 0.48f; /* default-on; WINE_SPATIAL_BASS=1 disables */
 
         if (g < 0.0f) g = 0.0f;
         if (g > 1.0f) g = 1.0f;
