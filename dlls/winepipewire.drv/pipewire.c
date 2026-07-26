@@ -26,6 +26,20 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+/* Requires libpipewire-0.3 >= 1.2.0: pw_stream_get_data_loop() and struct
+ * pw_loop::name.  The floor is the minimum API this file consumes, not the
+ * version the ship vehicle carries; configure.ac records what it excludes.
+ * An older library disables the driver there rather than failing the build,
+ * so do not paper one over with version conditionals here.
+ *
+ * pw_loop_locked() arrived in 1.6.0, above the 1.4.2 steamrt4 ships, so
+ * stream_loop_locked() below reconstructs it.  Check any newer entry point
+ * exists in the runtime, not merely in the headers: most are static inlines
+ * dispatching through a SPA interface, and spa_api_method_r returns its
+ * default when the method is missing, so the call compiles, links, runs and
+ * silently does nothing.  The i386 unixlib compounds this, building against
+ * the container's own PipeWire while resolving against the runtime's. */
+
 #if 0
 #pragma makedep unix
 #endif
@@ -45,6 +59,8 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <sys/random.h>
 
 #include <pipewire/pipewire.h>
 #include <pipewire/extensions/metadata.h>
@@ -81,6 +97,51 @@ static ULONG_PTR zero_bits = 0;
  * Stream and device structures (struct pulse_stream transplant)
  * ---------------------------------------------------------------------- */
 
+/* Ownership token for one period-sized capture slot; see the capture ring
+ * comment in struct pipewire_stream.
+ *
+ * State and publication sequence share ONE atomic word so every transition
+ * compare-exchanges the exact value it observed.  On the state alone, a slot
+ * evicted and republished between a scan and its claim would read FULL both
+ * times and be delivered ahead of older slots; folding the sequence in makes
+ * any recycle change the compared word, so the exchange fails and the caller
+ * rescans.  30 bits of sequence wrap after about 128 days of continuous
+ * capture at a 10 ms period, and an ABA needs that wrap inside one
+ * scan-to-claim window. */
+enum cap_slot_state
+{
+    CAP_FREE = 0,   /* nobody owns the bytes */
+    CAP_FILLING,    /* producer owns them */
+    CAP_FULL,       /* published, unclaimed */
+    CAP_INUSE,      /* consumer owns them */
+};
+
+#define CAP_STATE_BITS 2
+#define CAP_STATE_MASK 3u
+#define CAP_STATE(w)   ((w) & CAP_STATE_MASK)
+#define CAP_SEQ(w)     ((w) >> CAP_STATE_BITS)
+#define CAP_SEQ_MAX    (~0u >> CAP_STATE_BITS)
+#define CAP_WORD(s, st) ((((s) & CAP_SEQ_MAX) << CAP_STATE_BITS) | (st))
+
+struct cap_slot
+{
+    UINT32 word;    /* CAP_WORD(sequence, state); only changed by exchange */
+    BOOL disc;      /* audio was lost immediately before this slot; written
+                     * by whoever owns the slot, so it needs no atomicity */
+};
+
+/* An aligned base only keeps every element aligned if the stride is a whole
+ * number of alignments; pin that so a later field cannot break it silently. */
+C_ASSERT(sizeof(struct cap_slot) % _Alignof(struct cap_slot) == 0);
+
+/* Publication order of two slot words, wraparound safe.  Masking off the
+ * state leaves the sequence already shifted, so a signed difference gives the
+ * right answer across a 30-bit wrap. */
+static BOOL cap_seq_before(UINT32 a, UINT32 b)
+{
+    return (INT32)((a & ~CAP_STATE_MASK) - (b & ~CAP_STATE_MASK)) < 0;
+}
+
 struct pipewire_stream
 {
     EDataFlow dataflow;
@@ -102,33 +163,50 @@ struct pipewire_stream
     REFERENCE_TIME duration;
 
     INT32 locked;
-    BOOL started;
+    BOOL started; /* atomic: control release-stores, process callback load-acquires */
     SIZE_T bufsize_frames, real_bufsize_bytes, period_bytes;
-    /* render ring bookkeeping: lcl_offs/held track the application side,
-     * pa_offs/pa_held track the process-callback reader (field names kept
-     * from the pulse.c transplant for diffability).  Both sides run under
-     * the pw_thread_loop lock today (process callbacks are dispatched on
-     * that loop), so the counters are not concurrently accessed; the
-     * atomics on pa_held_bytes are retained only as future-proofing if an
-     * RT_PROCESS path returns.  pa_offs_bytes stays plain. */
+    /* Render ring bookkeeping.  lcl_offs/held are the application side,
+     * pa_offs/pa_held the process-callback reader (names kept from the
+     * pulse.c transplant).  pa_held_bytes crosses to the callback through
+     * atomics; pa_offs_bytes is the callback's own cursor and control paths
+     * reach it only through the data loop. */
     SIZE_T lcl_offs_bytes, pa_offs_bytes;
     SIZE_T tmp_buffer_bytes, held_bytes, pa_held_bytes;
     BYTE *local_buffer, *tmp_buffer;
     void *locked_ptr;
     UINT64 mmdev_period_usec;
 
-    /* capture staging ring: the analogue of PulseAudio's internal record
-     * buffer.  The pw_stream process callback (on the main loop thread,
-     * lock held) appends raw bytes here; the Wine timer thread slices
-     * period-sized ACPackets out of it with QPC timestamps.  Both sides
-     * take the loop lock, so cap_held_bytes is not concurrently accessed;
-     * the atomics are retained only as future-proofing for RT_PROCESS.
-     * cap_read_offs stays plain. */
+    /* Capture staging ring, the analogue of PulseAudio's internal record
+     * buffer: the process callback appends raw bytes, the Wine timer thread
+     * slices period-sized ACPackets out with QPC timestamps.
+     *
+     * Ownership of a slot's BYTES follows ownership of its state word, which
+     * only changes by compare-exchange (FREE, FILLING, FULL, INUSE), so
+     * neither side can enter a slot without taking it out of the other's
+     * reach.  That is also what keeps drop-oldest, which a plain SPSC ring
+     * cannot: with nothing free the producer reclaims the oldest FULL slot,
+     * an exchange that can only succeed if the consumer has not claimed it.
+     * Dropping the newest would hand the application a stale backlog after a
+     * stall.  Slots are published in fill order via seq, compared with
+     * wraparound safe signed differences. */
     BYTE *capture_ring;
-    SIZE_T capture_ring_size, cap_read_offs, cap_held_bytes;
+    SIZE_T capture_ring_size;
+    struct cap_slot *cap_slots;
+    UINT32 cap_n_slots;
+    UINT32 cap_w_slot;    /* producer-private: slot being filled */
+    SIZE_T cap_w_fill;    /* producer-private: bytes already in it */
+    UINT32 cap_w_seq;     /* producer-private: next publication sequence */
+    BOOL cap_filling;     /* producer-private: cap_w_slot is held FILLING */
+    BOOL cap_lost;        /* producer-private: loss with no sequence gap,
+                           * charged to the next slot published */
+    UINT32 cap_next_seq;  /* consumer-private: sequence expected next */
 
     INT64 clock_lastpos, clock_written;
+    /* atomic: process callback relaxed-increments, timer/control relaxed-load */
     UINT32 underrun_count, overrun_count, bad_buffer_count;
+    UINT32 ring_warned;   /* RING_OP_* bits already reported for this stream */
+    UINT32 cb_seq;        /* callback-private: callbacks entered */
+    UINT32 cb_mark;       /* diagnostic breadcrumb, never read by the driver */
     BOOL underrun_logged, overrun_logged, bad_buffer_logged;
 
     struct list packet_free_head;
@@ -147,6 +225,10 @@ typedef struct _ACPacket
     BYTE *data;
     UINT32 discont;
 } ACPacket;
+
+/* As for the slot array: an aligned base only keeps every element aligned if
+ * the stride is a whole number of alignments. */
+C_ASSERT(sizeof(ACPacket) % _Alignof(ACPacket) == 0);
 
 struct pw_phys_device
 {
@@ -272,6 +354,43 @@ static WCHAR *utf8_to_wstr(const char *s)
     return w;
 }
 
+/* Post-mortem breadcrumb.  The process callback publishes how far it got into
+ * stream->cb_mark, which the driver never reads; it exists to be recovered
+ * from a core file.  Zero means the callback has never run for this stream,
+ * otherwise the low bits give the phase and the rest a callback count.
+ *
+ * The stores are relaxed, so this is a HINT and not a happens-before witness:
+ * a mark can be published earlier or later than the code it brackets.
+ * Release ordering would fix that and is not worth paying for on the hot
+ * path.  Read the value as "roughly here", not as proof. */
+#define CB_ENTER 1  /* in the callback, buffer not yet validated */
+#define CB_BODY  2  /* buffer validated, moving audio */
+#define CB_DONE  3  /* buffer queued back, callback returning */
+#define CB_MARK(s, ph) \
+    __atomic_store_n(&(s)->cb_mark, ((s)->cb_seq << 2) | (ph), __ATOMIC_RELAXED)
+
+/* Render dispatch mode, read from the environment once per process.  With
+ * PW_STREAM_FLAG_RT_PROCESS the process callback runs on PipeWire's realtime
+ * data thread rather than the thread loop, and libpipewire stops asking for
+ * async scheduling on the node.  What that is worth in latency is the graph's
+ * decision; what it removes for certain is the lock that serialized the
+ * callback against the control paths.  Capture never sets it: its source is
+ * its own driver, so it has nothing to win for the same exposure. */
+static BOOL rt_render;
+
+/* Identifies one process run, so a PROTON_LOG and a core dump can be shown to
+ * describe the same run instead of assumed to: every dispatch line carries
+ * the value and the global is readable out of a core by name.
+ *
+ * Zero is the never-initialised sentinel and the live value is forced off it,
+ * so a core taken before attach finished does not compare zero against zero.
+ * Entropy is 64 bits from getrandom mixed with the pid and a monotonic
+ * nanosecond count; a bare pid would not do, since pids recycle and a
+ * collision certifies a mismatched pairing.  Treat the value as opaque.
+ *
+ * It says nothing about scheduling. */
+static UINT64 dispatch_token;
+
 static struct pipewire_stream *handle_get_stream(stream_handle h)
 {
     return (struct pipewire_stream *)(UINT_PTR)h;
@@ -302,6 +421,48 @@ static UINT spa_format_bytes(enum spa_audio_format f)
 static void silence_buffer(enum spa_audio_format format, BYTE *buffer, UINT32 bytes)
 {
     memset(buffer, format == SPA_AUDIO_FORMAT_U8 ? 0x80 : 0, bytes);
+}
+
+/* Take ownership of the slot the producer is due to fill next.  A FREE slot
+ * is taken outright; otherwise the oldest FULL slot is evicted, which is what
+ * makes the policy drop-oldest.  Either transition is a compare-exchange, so
+ * a slot the consumer has already claimed can never be taken from under it,
+ * and the producer simply moves on to the next one.  Runs on the process
+ * callback: no allocation, no logging, no Wine calls. */
+static BOOL cap_acquire_slot(struct pipewire_stream *stream)
+{
+    UINT32 tries;
+
+    for (tries = 0; tries < stream->cap_n_slots; tries++)
+    {
+        struct cap_slot *slot = &stream->cap_slots[stream->cap_w_slot];
+        UINT32 w = __atomic_load_n(&slot->word, __ATOMIC_ACQUIRE);
+        UINT32 st = CAP_STATE(w);
+
+        /* Exchange the whole observed word, not just the state, so a slot
+         * that was recycled since the load fails here rather than being
+         * silently taken in its new generation. */
+        if ((st == CAP_FREE || st == CAP_FULL) &&
+            __atomic_compare_exchange_n(&slot->word, &w, CAP_WORD(CAP_SEQ(w), CAP_FILLING),
+                                        FALSE, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE))
+        {
+            if (st == CAP_FULL)
+            {
+                /* Evicted unread audio.  Do NOT flag here: eviction removes a
+                 * sequence number, and the consumer turns that missing
+                 * sequence into the discontinuity on exactly the packet that
+                 * gapped.  Flagging the slot we are about to publish would
+                 * put it on a later packet instead. */
+                __atomic_add_fetch(&stream->overrun_count, 1, __ATOMIC_RELAXED);
+            }
+            stream->cap_filling = TRUE;
+            stream->cap_w_fill = 0;
+            return TRUE;
+        }
+        /* CAP_FILLING, CAP_INUSE, or the consumer won the race: move on. */
+        stream->cap_w_slot = (stream->cap_w_slot + 1) % stream->cap_n_slots;
+    }
+    return FALSE;
 }
 
 /* copy n bytes out of a byte ring starting at offs, wrapping at ring_size */
@@ -603,9 +764,31 @@ static void pipewire_set_plugin_dirs(void)
 
 static NTSTATUS pipewire_process_attach(void *args)
 {
+    const char *rt = getenv("WINEPIPEWIRE_RT");
+    struct timespec ts;
+    UINT64 rnd = 0;
+
     pipewire_set_plugin_dirs();
     pw_init(NULL, NULL);
     TRACE("PipeWire %s, header %s\n", pw_get_library_version(), pw_get_headers_version());
+
+    /* First unix call the driver receives (mmdevapi/main.c:94), so the token
+     * is set before any stream can connect and no dispatch line can be
+     * emitted without one. */
+    if (getrandom(&rnd, sizeof(rnd), 0) != (ssize_t)sizeof(rnd))
+        rnd = 0;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    dispatch_token = rnd ^ ((UINT64)(getpid() & 0xffff) << 48) ^
+                     ((((UINT64)ts.tv_sec * 1000000000 + ts.tv_nsec)) & 0xffffffffffffull);
+    if (!dispatch_token)
+        dispatch_token = 1;
+
+    rt_render = rt && !strcmp(rt, "1");
+    /* Only what was asked for.  What actually happens is not known until a
+     * stream connects and the data loop can be compared, so the line that a
+     * crash report is read against is emitted there, not here. */
+    TRACE("WINEPIPEWIRE_RT=%d requested, session=%016llx\n", rt_render,
+          (unsigned long long)dispatch_token);
     return STATUS_SUCCESS;
 }
 
@@ -1539,9 +1722,11 @@ static HRESULT pipewire_info_from_waveformat(struct pipewire_stream *stream, con
  * pw_stream callbacks (foreign thread, loop lock held: no ntdll/TRACE)
  * ---------------------------------------------------------------------- */
 
-static void apply_volume(const struct pipewire_stream *stream, BYTE *buffer, UINT32 bytes)
+/* vol is a caller-owned snapshot: the process callback must not re-read
+ * stream->vol, which SetVolumes mutates concurrently. */
+static void apply_volume(const struct pipewire_stream *stream, const float *vol,
+                         BYTE *buffer, UINT32 bytes)
 {
-    const float *vol = stream->vol;
     UINT32 i, channels = stream->info.channels, mute = 0;
     BOOL adjust = FALSE;
     BYTE *end;
@@ -1695,21 +1880,34 @@ static void on_stream_process(void *data)
     struct spa_buffer *buf;
     struct spa_data *d;
 
+    stream->cb_seq++;
+    CB_MARK(stream, CB_ENTER);
+
     if (!(b = pw_stream_dequeue_buffer(stream->pw)))
         return;
     buf = b->buffer;
     if (!buf || !buf->n_datas || !buf->datas ||
         !(d = &buf->datas[0])->data || !d->chunk)
     {
-        stream->bad_buffer_count++;
+        __atomic_add_fetch(&stream->bad_buffer_count, 1, __ATOMIC_RELAXED);
+        if (stream->dataflow == eCapture)
+        {
+            /* The buffer is discarded, so audio was lost.  Charge it to the
+             * next slot published, the same as a clamp or an all-slots-held
+             * drop; without this the application sees the gap with nothing to
+             * explain it.  Producer-private, so a plain store is right. */
+            stream->cap_lost = TRUE;
+        }
         pw_stream_queue_buffer(stream->pw, b);
         return;
     }
+    CB_MARK(stream, CB_BODY);
 
     if (stream->dataflow == eRender)
     {
         UINT32 maxsize = d->maxsize;
-        UINT32 req_frames, need_bytes, n;
+        UINT32 req_frames, need_bytes, n, c;
+        float vol[PW_CHANNELS_MAX];
 
         if (!b->requested || b->requested > maxsize / stream->frame_size)
             req_frames = maxsize / stream->frame_size;
@@ -1717,16 +1915,21 @@ static void on_stream_process(void *data)
             req_frames = (UINT32)b->requested;
         need_bytes = req_frames * stream->frame_size;
 
-        if (stream->started)
+        if (__atomic_load_n(&stream->started, __ATOMIC_ACQUIRE))
         {
+            /* copy_from_ring wraps once, so a count above the ring size
+             * would read past the allocation. */
             n = min(need_bytes, __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE));
+            n = min(n, stream->real_bufsize_bytes);
             copy_from_ring(d->data, stream->local_buffer, stream->real_bufsize_bytes,
                            stream->pa_offs_bytes, n);
-            apply_volume(stream, d->data, n);
+            for (c = 0; c < stream->info.channels; c++)
+                __atomic_load(&stream->vol[c], &vol[c], __ATOMIC_ACQUIRE);
+            apply_volume(stream, vol, d->data, n);
             if (n < need_bytes)
             {
                 silence_buffer(stream->info.format, (BYTE *)d->data + n, need_bytes - n);
-                stream->underrun_count++;
+                __atomic_add_fetch(&stream->underrun_count, 1, __ATOMIC_RELAXED);
             }
             stream->pa_offs_bytes = (stream->pa_offs_bytes + n) % stream->real_bufsize_bytes;
             __atomic_sub_fetch(&stream->pa_held_bytes, n, __ATOMIC_RELEASE);
@@ -1741,39 +1944,65 @@ static void on_stream_process(void *data)
     }
     else /* eCapture */
     {
-        if (stream->started && stream->capture_ring)
+        if (__atomic_load_n(&stream->started, __ATOMIC_ACQUIRE) && stream->capture_ring)
         {
             UINT32 offs = min(d->chunk->offset, d->maxsize);
             UINT32 avail = min(d->chunk->size, d->maxsize - offs);
             const BYTE *src = (const BYTE *)d->data + offs;
-            SIZE_T n = avail, cap_held;
+            SIZE_T n = avail;
 
+            /* A chunk larger than the whole ring can only be represented by
+             * its tail, which is the newest audio in it. */
             if (n > stream->capture_ring_size)
             {
                 src += n - stream->capture_ring_size;
                 n = stream->capture_ring_size;
+                __atomic_add_fetch(&stream->overrun_count, 1, __ATOMIC_RELAXED);
+                stream->cap_lost = TRUE;
             }
-            cap_held = __atomic_load_n(&stream->cap_held_bytes, __ATOMIC_ACQUIRE);
-            if (cap_held + n > stream->capture_ring_size)
+
+            while (n)
             {
-                SIZE_T drop = cap_held + n - stream->capture_ring_size;
-                stream->cap_read_offs = (stream->cap_read_offs + drop) % stream->capture_ring_size;
-                __atomic_sub_fetch(&stream->cap_held_bytes, drop, __ATOMIC_RELEASE);
-                stream->overrun_count++;
-            }
-            if (n)
-            {
-                SIZE_T woff = (stream->cap_read_offs + stream->cap_held_bytes) % stream->capture_ring_size;
-                SIZE_T first = min(n, stream->capture_ring_size - woff);
-                memcpy(stream->capture_ring + woff, src, first);
-                if (n > first)
-                    memcpy(stream->capture_ring, src + first, n - first);
-                __atomic_add_fetch(&stream->cap_held_bytes, n, __ATOMIC_RELEASE);
+                struct cap_slot *slot;
+                SIZE_T take;
+
+                if (!stream->cap_filling && !cap_acquire_slot(stream))
+                {
+                    /* Every slot is held by the consumer: the rest of this
+                     * chunk is dropped, and a drop must be reported like any
+                     * other, otherwise the application sees a gap with no
+                     * discontinuity to explain it. */
+                    __atomic_add_fetch(&stream->overrun_count, 1, __ATOMIC_RELAXED);
+                    stream->cap_lost = TRUE;
+                    break;
+                }
+                slot = &stream->cap_slots[stream->cap_w_slot];
+                take = min(n, stream->period_bytes - stream->cap_w_fill);
+                memcpy(stream->capture_ring + stream->cap_w_slot * stream->period_bytes +
+                       stream->cap_w_fill, src, take);
+                stream->cap_w_fill += take;
+                src += take;
+                n -= take;
+                if (stream->cap_w_fill == stream->period_bytes)
+                {
+                    /* We own the slot as CAP_FILLING, so nobody else can
+                     * transition it and a release store suffices.  The
+                     * release also publishes slot->disc. */
+                    slot->disc = stream->cap_lost;
+                    stream->cap_lost = FALSE;
+                    __atomic_store_n(&slot->word,
+                                     CAP_WORD(stream->cap_w_seq, CAP_FULL), __ATOMIC_RELEASE);
+                    stream->cap_w_seq = (stream->cap_w_seq + 1) & CAP_SEQ_MAX;
+                    stream->cap_filling = FALSE;
+                    stream->cap_w_slot = (stream->cap_w_slot + 1) % stream->cap_n_slots;
+                    stream->cap_w_fill = 0;
+                }
             }
         }
     }
 
     pw_stream_queue_buffer(stream->pw, b);
+    CB_MARK(stream, CB_DONE);
 }
 
 static const struct pw_stream_events stream_events = {
@@ -1878,12 +2107,98 @@ static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, const cha
                           stream->dataflow == eRender ? PW_DIRECTION_OUTPUT : PW_DIRECTION_INPUT,
                           PW_ID_ANY,
                           PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
-                          PW_STREAM_FLAG_INACTIVE,
+                          PW_STREAM_FLAG_INACTIVE |
+                          (rt_render && stream->dataflow == eRender ?
+                           PW_STREAM_FLAG_RT_PROCESS : 0),
                           params, 1);
         if (rc < 0)
         {
             WARN("pw_stream_connect failed for stream %p: %d.\n", stream, rc);
             return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+        }
+    }
+
+    /* Where the process callback actually ended up.  RT_PROCESS asks for the
+     * data thread, but node.loop.class from PIPEWIRE_PROPS or a client.conf
+     * stream.rules entry decides independently, in both directions, so report
+     * the measured loop rather than the request.
+     *
+     * node.async is reported beside it because RT_PROCESS suppresses both
+     * properties (1.4.2 stream.c:2021-2025) while rules and PIPEWIRE_PROPS
+     * are applied afterwards (2063-2074) and can restore it alone.  The value
+     * is the property pw_stream_get_properties() reports after connect, the
+     * dict those stages wrote to (1792-1795) and the node reads
+     * (impl-node.c:1234).  It is NOT the graph's scheduling mode: the link
+     * decides from the OR of both nodes and the ASYNC flag on both ports
+     * (impl-link.c:1345-1347).  This line certifies which loop the callback
+     * runs on and what the node's async property became; it does not certify
+     * latency.
+     *
+     * Every line ends with session=<16 lowercase hex>, the per-process token
+     * that pairs the log with a core dump of the same run.
+     *
+     * Once per distinct (dataflow, requested, effective, async) combination.
+     * The matched case is WARN so the A/B recipe can grep it without full
+     * tracing; anything needing action is at ERR. */
+    {
+        struct pw_loop *dl = pw_stream_get_data_loop(stream->pw);
+        const struct pw_properties *sprops = pw_stream_get_properties(stream->pw);
+        const char *async = sprops ? pw_properties_get(sprops, PW_KEY_NODE_ASYNC) : NULL;
+        const BOOL want_data = rt_render && stream->dataflow == eRender;
+        const BOOL got_data = dl != pw_thread_loop_get_loop(pw_loop_global);
+        const BOOL async_on = async && pw_properties_parse_bool(async);
+        const UINT32 bit = 1u << ((stream->dataflow == eRender ? 8 : 0) |
+                                  (want_data ? 4 : 0) | (got_data ? 2 : 0) |
+                                  (async_on ? 1 : 0));
+        static UINT32 reported;
+
+        if (!(reported & bit))
+        {
+            const char *flow = stream->dataflow == eRender ? "render" : "capture";
+            const char *req = want_data ? "data-thread" : "driver-loop";
+            const char *eff = got_data ? "data-thread" : "driver-loop";
+            const char *name = dl && dl->name ? dl->name : "?";
+
+            reported |= bit;
+            if (want_data != got_data)
+            {
+                ERR("audio dispatch: %s requested %s, effective %s, node.async=%s, "
+                    "loop \"%s\" -- MISMATCH, the requested mode is NOT in force, "
+                    "session=%016llx\n", flow, req, eff, async ? async : "unset", name,
+                    (unsigned long long)dispatch_token);
+
+                if (want_data)
+                    ERR("audio dispatch: PW_STREAM_FLAG_RT_PROCESS did not take effect.  "
+                        "node.loop.class is pinned to the main loop, so this run does "
+                        "not exercise the realtime path and must not be reported as "
+                        "one.  session=%016llx\n", (unsigned long long)dispatch_token);
+                else
+                    ERR("audio dispatch: processing was redirected off the driver loop "
+                        "by node.loop.class; this configuration is not validated and "
+                        "can corrupt audio.  session=%016llx\n",
+                        (unsigned long long)dispatch_token);
+            }
+            else
+            {
+                WARN("audio dispatch: %s requested %s, effective %s, node.async=%s, "
+                     "loop \"%s\", session=%016llx\n", flow, req, eff,
+                     async ? async : "unset", name, (unsigned long long)dispatch_token);
+
+                if (want_data && async_on)
+                    ERR("audio dispatch: RT_PROCESS suppresses node.async, so the "
+                        "property being set means a stream.rules entry or "
+                        "PIPEWIRE_PROPS put it back.  An override is fighting the "
+                        "flag: the callback is on the data thread, but the scheduling "
+                        "the flag asks for must not be assumed for this run.  "
+                        "session=%016llx\n", (unsigned long long)dispatch_token);
+                else if (!want_data && !async_on)
+                    ERR("audio dispatch: libpipewire sets node.async for a stream "
+                        "without RT_PROCESS, so the property being %s means an "
+                        "override cleared it.  The callback runs on the driver loop, "
+                        "which is not realtime scheduled, with nothing asking the "
+                        "graph for slack in front of it.  session=%016llx\n",
+                        async ? async : "absent", (unsigned long long)dispatch_token);
+            }
         }
     }
 
@@ -2018,6 +2333,7 @@ static NTSTATUS pipewire_create_stream(void *args)
     else
     {
         UINT32 capture_packets, unalign;
+        SIZE_T slots_offs, packets_offs;
 
         if ((unalign = bufsize_bytes % stream->period_bytes))
             bufsize_bytes += stream->period_bytes - unalign;
@@ -2025,16 +2341,30 @@ static NTSTATUS pipewire_create_stream(void *args)
         stream->real_bufsize_bytes = bufsize_bytes;
         capture_packets = stream->real_bufsize_bytes / stream->period_bytes;
 
-        size = stream->real_bufsize_bytes + capture_packets * sizeof(ACPacket);
+        /* The packet array follows the audio, so it needs the same rounding
+         * the slot array gets: real_bufsize_bytes is a multiple of
+         * period_bytes, which is a frame count times a frame size that can be
+         * 1, 3 or 6 bytes for packed 8 and 24 bit formats.  ACPacket holds
+         * list pointers, so a misaligned array is undefined and faults on
+         * targets that do not fix up unaligned loads. */
+        packets_offs = (stream->real_bufsize_bytes + _Alignof(ACPacket) - 1) &
+                       ~(SIZE_T)(_Alignof(ACPacket) - 1);
+        size = packets_offs + capture_packets * sizeof(ACPacket);
         if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
                                     zero_bits, &size, MEM_COMMIT, PAGE_READWRITE))
         {
             WARN("Out of memory allocating capture buffer (%lu bytes).\n", (unsigned long)size);
             hr = E_OUTOFMEMORY;
         }
+        else if ((UINT_PTR)((char *)stream->local_buffer + packets_offs) & (_Alignof(ACPacket) - 1))
+        {
+            WARN("Capture packet array misaligned at %p.\n",
+                 (char *)stream->local_buffer + packets_offs);
+            hr = E_FAIL;
+        }
         else
         {
-            ACPacket *cur_packet = (ACPacket *)((char *)stream->local_buffer + stream->real_bufsize_bytes);
+            ACPacket *cur_packet = (ACPacket *)((char *)stream->local_buffer + packets_offs);
             BYTE *data = stream->local_buffer;
             silence_buffer(stream->info.format, stream->local_buffer, stream->real_bufsize_bytes);
             for (i = 0; i < capture_packets; ++i, ++cur_packet)
@@ -2044,13 +2374,35 @@ static NTSTATUS pipewire_create_stream(void *args)
                 data += stream->period_bytes;
             }
 
-            /* staging ring fed by the process callback */
-            size = stream->capture_ring_size = stream->real_bufsize_bytes;
+            /* Staging ring carved into period-sized slots with the state
+             * array appended.  The array has to start aligned: the ring
+             * length is a multiple of period_bytes, which need not be a
+             * multiple of four (packed 24 bit stereo at 30 ms gives 7938),
+             * and misaligned atomics are undefined and not lock free
+             * everywhere. */
+            stream->cap_n_slots = stream->real_bufsize_bytes / stream->period_bytes;
+            stream->capture_ring_size = stream->real_bufsize_bytes;
+            slots_offs = (stream->capture_ring_size + _Alignof(struct cap_slot) - 1) &
+                         ~(SIZE_T)(_Alignof(struct cap_slot) - 1);
+            size = slots_offs + stream->cap_n_slots * sizeof(*stream->cap_slots);
             if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->capture_ring,
                                         zero_bits, &size, MEM_COMMIT, PAGE_READWRITE))
             {
                 WARN("Out of memory allocating capture ring (%lu bytes).\n", (unsigned long)size);
                 hr = E_OUTOFMEMORY;
+            }
+            else
+            {
+                stream->cap_slots = (struct cap_slot *)(stream->capture_ring + slots_offs);
+                /* The allocator hands back page-aligned memory and the offset
+                 * above is rounded, so this cannot trip; refuse the stream
+                 * rather than run the atomics on a misaligned word if it
+                 * ever does. */
+                if ((UINT_PTR)stream->cap_slots & (_Alignof(struct cap_slot) - 1))
+                {
+                    WARN("Capture slot array misaligned at %p.\n", stream->cap_slots);
+                    hr = E_FAIL;
+                }
             }
         }
     }
@@ -2099,9 +2451,13 @@ static NTSTATUS pipewire_release_stream(void *args)
 
     pw_thread_loop_lock(pw_loop_global);
     TRACE("stream %p.\n", stream);
-    if (stream->underrun_count || stream->overrun_count || stream->bad_buffer_count)
-        WARN("stream %p underran %u times, overran %u times, bad buffers %u.\n",
-             stream, stream->underrun_count, stream->overrun_count, stream->bad_buffer_count);
+    if (__atomic_load_n(&stream->underrun_count, __ATOMIC_RELAXED) ||
+        __atomic_load_n(&stream->overrun_count, __ATOMIC_RELAXED) ||
+        __atomic_load_n(&stream->bad_buffer_count, __ATOMIC_RELAXED))
+        WARN("stream %p underran %u times, overran %u times, bad buffers %u.\n", stream,
+             __atomic_load_n(&stream->underrun_count, __ATOMIC_RELAXED),
+             __atomic_load_n(&stream->overrun_count, __ATOMIC_RELAXED),
+             __atomic_load_n(&stream->bad_buffer_count, __ATOMIC_RELAXED));
     if (stream->period)
     {
         struct pipewire_period *period = stream->period;
@@ -2163,11 +2519,60 @@ static NTSTATUS pipewire_release_stream(void *args)
  * thread per (device, period) group)
  * ---------------------------------------------------------------------- */
 
-/* Slice period-sized packets out of the staging ring.  Runs on the Wine
- * timer thread with the loop lock held: ntdll (QPC) is legal here. */
+/* Claim the oldest published slot, if any, and return it owned by us.  Runs
+ * on the Wine timer thread.  Slots are ordered by publication sequence with a
+ * wraparound safe comparison, and the claim exchanges the whole state and
+ * sequence word, so the slot we end up owning is exactly the one the scan
+ * chose rather than whatever the producer put there since. */
+static struct cap_slot *cap_claim_slot(struct pipewire_stream *stream, UINT32 *out_idx,
+                                      UINT32 *out_seq)
+{
+    UINT32 pass;
+
+    for (pass = 0; pass < stream->cap_n_slots; pass++)
+    {
+        UINT32 best = stream->cap_n_slots, best_word = 0, i;
+
+        for (i = 0; i < stream->cap_n_slots; i++)
+        {
+            UINT32 w = __atomic_load_n(&stream->cap_slots[i].word, __ATOMIC_ACQUIRE);
+
+            if (CAP_STATE(w) != CAP_FULL)
+                continue;
+            if (best == stream->cap_n_slots || cap_seq_before(w, best_word))
+            {
+                best = i;
+                best_word = w;
+            }
+        }
+        if (best == stream->cap_n_slots)
+            return NULL;
+
+        /* Exchange the exact word the scan saw.  If the producer evicted and
+         * republished this slot in between, its sequence changed and this
+         * fails, so we rescan instead of delivering out of order. */
+        if (__atomic_compare_exchange_n(&stream->cap_slots[best].word, &best_word,
+                                        CAP_WORD(CAP_SEQ(best_word), CAP_INUSE),
+                                        FALSE, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE))
+        {
+            *out_idx = best;
+            *out_seq = CAP_SEQ(best_word);
+            return &stream->cap_slots[best];
+        }
+        /* The producer evicted it first; rescan. */
+    }
+    return NULL;
+}
+
+/* Slice period-sized packets out of the staging ring.  Runs on the Wine timer
+ * thread with the loop lock held: ntdll (QPC) is legal here.  Only ever
+ * touches slots it has taken to CAP_INUSE. */
 static void pipewire_read(struct pipewire_stream *stream)
 {
-    while (__atomic_load_n(&stream->cap_held_bytes, __ATOMIC_ACQUIRE) >= stream->period_bytes)
+    struct cap_slot *slot;
+    UINT32 idx, seq;
+
+    while ((slot = cap_claim_slot(stream, &idx, &seq)))
     {
         ACPacket *p, *next;
         LARGE_INTEGER stamp, freq;
@@ -2175,14 +2580,19 @@ static void pipewire_read(struct pipewire_stream *stream)
         if (!(p = (ACPacket *)list_head(&stream->packet_free_head)))
         {
             p = (ACPacket *)list_head(&stream->packet_filled_head);
-            if (!p) return;
-            if (!p->discont)
+            if (!p)
             {
-                next = (ACPacket *)p->entry.next;
-                next->discont = 1;
+                __atomic_store_n(&slot->word, CAP_WORD(seq, CAP_FULL), __ATOMIC_RELEASE);
+                return;
             }
-            else
-                p = (ACPacket *)list_tail(&stream->packet_filled_head);
+            /* Recycle the oldest packet, matching the ring below, and move
+             * the discontinuity onto its successor, which is the packet that
+             * gaps.  Recycling the newest instead would discard the freshest
+             * audio, leave the gap unmarked and clear a flag the application
+             * has not read.  The free list is empty here, so the successor
+             * always exists. */
+            next = (ACPacket *)p->entry.next;
+            next->discont = 1;
         }
         else
         {
@@ -2190,14 +2600,24 @@ static void pipewire_read(struct pipewire_stream *stream)
         }
         NtQueryPerformanceCounter(&stamp, &freq);
         p->qpcpos = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
-        p->discont = 0;
+        /* Two kinds of loss, each attributed to the packet that follows it.
+         * An eviction removes a sequence number, so an unexpected sequence
+         * means audio was lost immediately before this packet.  A clamp or an
+         * all-slots-held drop loses audio without removing a sequence, so the
+         * producer marks the next slot it publishes.
+         *
+         * The expected sequence starts at zero, not at whatever arrives
+         * first, so opening slots evicted before the timer's first claim are
+         * reported too; a first-claim baseline would hide a loss bounded only
+         * by how long that claim is delayed. */
+        p->discont = slot->disc || seq != stream->cap_next_seq;
+        stream->cap_next_seq = (seq + 1) & CAP_SEQ_MAX;
         list_remove(&p->entry);
         list_add_tail(&stream->packet_filled_head, &p->entry);
 
-        copy_from_ring(p->data, stream->capture_ring, stream->capture_ring_size,
-                       stream->cap_read_offs, stream->period_bytes);
-        stream->cap_read_offs = (stream->cap_read_offs + stream->period_bytes) % stream->capture_ring_size;
-        __atomic_sub_fetch(&stream->cap_held_bytes, stream->period_bytes, __ATOMIC_RELEASE);
+        memcpy(p->data, stream->capture_ring + (SIZE_T)idx * stream->period_bytes,
+               stream->period_bytes);
+        __atomic_store_n(&slot->word, CAP_WORD(seq, CAP_FREE), __ATOMIC_RELEASE);
     }
 }
 
@@ -2314,20 +2734,24 @@ static void pipewire_period_timer_loop(void *args)
 
         LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
         {
-            if (stream->underrun_count && !stream->underrun_logged)
+            UINT32 n;
+
+            if ((n = __atomic_load_n(&stream->underrun_count, __ATOMIC_RELAXED)) &&
+                !stream->underrun_logged)
             {
-                WARN("stream %p first underrun (count %u).\n", stream, stream->underrun_count);
+                WARN("stream %p first underrun (count %u).\n", stream, n);
                 stream->underrun_logged = TRUE;
             }
-            if (stream->overrun_count && !stream->overrun_logged)
+            if ((n = __atomic_load_n(&stream->overrun_count, __ATOMIC_RELAXED)) &&
+                !stream->overrun_logged)
             {
-                WARN("stream %p first overrun (count %u).\n", stream, stream->overrun_count);
+                WARN("stream %p first overrun (count %u).\n", stream, n);
                 stream->overrun_logged = TRUE;
             }
-            if (stream->bad_buffer_count && !stream->bad_buffer_logged)
+            if ((n = __atomic_load_n(&stream->bad_buffer_count, __ATOMIC_RELAXED)) &&
+                !stream->bad_buffer_logged)
             {
-                WARN("stream %p first bad process buffer (count %u).\n",
-                     stream, stream->bad_buffer_count);
+                WARN("stream %p first bad process buffer (count %u).\n", stream, n);
                 stream->bad_buffer_logged = TRUE;
             }
             if (stream->event)
@@ -2418,9 +2842,16 @@ static NTSTATUS pipewire_start(void *args)
         return STATUS_SUCCESS;
     }
 
+    /* Publish started before activating: once the node is active the process
+     * callback may run, and it must not see a started=FALSE stream that is
+     * already producing.  set_active still precedes add_stream_to_period so a
+     * failed activation cannot leave the stream linked into the period. */
+    __atomic_store_n(&stream->started, TRUE, __ATOMIC_RELEASE);
+
     if (pw_stream_set_active(stream->pw, true) < 0)
     {
         /* mirrors pulse_start's failed-uncork path */
+        __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
         WARN("pw_stream_set_active failed for stream %p.\n", stream);
         params->result = E_FAIL;
         pw_thread_loop_unlock(pw_loop_global);
@@ -2431,11 +2862,11 @@ static NTSTATUS pipewire_start(void *args)
     {
         if (pw_stream_set_active(stream->pw, false) < 0)
             WARN("pw_stream_set_active(false) rollback failed for stream %p.\n", stream);
+        __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
         pw_thread_loop_unlock(pw_loop_global);
         return STATUS_SUCCESS;
     }
 
-    stream->started = TRUE;
     pw_thread_loop_unlock(pw_loop_global);
     return STATUS_SUCCESS;
 }
@@ -2463,16 +2894,98 @@ static NTSTATUS pipewire_stop(void *args)
 
     if (pw_stream_set_active(stream->pw, false) < 0)
         WARN("pw_stream_set_active(false) failed for stream %p.\n", stream);
-    stream->started = FALSE;
+    /* after set_active(false): its data-loop barrier has drained any
+     * in-flight callback, so no reader can still observe started=TRUE */
+    __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
     pw_thread_loop_unlock(pw_loop_global);
     params->result = S_OK;
     return STATUS_SUCCESS;
+}
+
+/* Run fn with the stream's process callback excluded, from a control path
+ * that already holds the thread loop lock.  pw_loop_locked() does this in one
+ * call but needs 1.6.0.  The two cases are not symmetric:
+ *
+ *   - Data loop IS the thread loop, which is every stream without
+ *     RT_PROCESS: the caller already holds the recursive mutex the callback
+ *     is dispatched under, so fn runs inline.  A blocking invoke would
+ *     deadlock, waiting on the loop thread that waits for the caller's lock.
+ *
+ *   - Otherwise the callback is on a data thread the lock does not hold off,
+ *     so fn is marshalled onto it and runs between dispatches.
+ *
+ * The inline branch cannot fail; the invoke can, on queue allocation.  A
+ * negative return means the cursors were not touched, and no caller may
+ * publish state that assumes the marshalled step ran.  -ENODEV is not a
+ * marshal failure but a pw_stream already destroyed by a core reconnect,
+ * which the callers map to a different HRESULT. */
+static int stream_loop_locked(struct pipewire_stream *stream, spa_invoke_func_t fn)
+{
+    struct pw_loop *data_loop;
+
+    if (!stream->pw || !(data_loop = pw_stream_get_data_loop(stream->pw)))
+        return -ENODEV;
+
+    if (data_loop == pw_thread_loop_get_loop(pw_loop_global))
+        return fn(data_loop->loop, false, 0, NULL, 0, stream);
+
+    return pw_loop_invoke(data_loop, fn, 0, NULL, 0, true, stream);
+}
+
+/* The device is gone only when the stream object itself is; a loop that could
+ * not be reached is a transient service failure and the ring is intact. */
+static HRESULT ring_op_hresult(int res)
+{
+    return res == -ENODEV ? AUDCLNT_E_DEVICE_INVALIDATED : AUDCLNT_E_SERVICE_NOT_RUNNING;
+}
+
+/* Operations that reach the render ring's read cursor.  Used to report a
+ * failed marshal once per stream per operation, so a loop that cannot take an
+ * invoke cannot flood the log. */
+#define RING_OP_RESET   0
+#define RING_OP_RESYNC  1
+#define RING_OP_RATE    2
+
+/* Runs on a Wine control thread under the loop lock, so logging is legal. */
+static void ring_op_failed(struct pipewire_stream *stream, unsigned int op,
+                           const char *what, int res)
+{
+    if (stream->ring_warned & (1u << op))
+        return;
+    stream->ring_warned |= 1u << op;
+    WARN("stream %p: %s could not be run against the data loop (%d); the "
+         "operation was abandoned and the ring is unchanged.\n", stream, what, res);
+}
+
+/* The render ring's read cursor belongs to the process callback; these run
+ * through stream_loop_locked so the callback cannot be in flight. */
+static int do_reset_ring(struct spa_loop *loop, bool async, uint32_t seq,
+                         const void *data, size_t size, void *user_data)
+{
+    struct pipewire_stream *stream = user_data;
+
+    stream->pa_offs_bytes = 0;
+    __atomic_store_n(&stream->pa_held_bytes, 0, __ATOMIC_RELEASE);
+    return 0;
+}
+
+/* Republish the writer's cursor after an overflow.  Reads the Wine-side
+ * fields, which the caller holds the thread loop lock over. */
+static int do_resync_ring(struct spa_loop *loop, bool async, uint32_t seq,
+                          const void *data, size_t size, void *user_data)
+{
+    struct pipewire_stream *stream = user_data;
+
+    stream->pa_offs_bytes = stream->lcl_offs_bytes;
+    __atomic_store_n(&stream->pa_held_bytes, stream->held_bytes, __ATOMIC_RELEASE);
+    return 0;
 }
 
 static NTSTATUS pipewire_reset(void *args)
 {
     struct reset_params *params = args;
     struct pipewire_stream *stream = handle_get_stream(params->stream);
+    UINT32 i;
 
     TRACE("stream %p.\n", stream);
     pw_thread_loop_lock(pw_loop_global);
@@ -2502,18 +3015,40 @@ static NTSTATUS pipewire_reset(void *args)
 
     if (stream->dataflow == eRender)
     {
+        /* Clear the read cursor before the cursors that describe it, so a
+         * failed marshal leaves every one of them as it was rather than a
+         * zeroed half. */
+        int res = stream_loop_locked(stream, do_reset_ring);
+
+        if (res < 0)
+        {
+            ring_op_failed(stream, RING_OP_RESET, "the render ring reset", res);
+            pw_thread_loop_unlock(pw_loop_global);
+            params->result = ring_op_hresult(res);
+            return STATUS_SUCCESS;
+        }
         stream->clock_lastpos = stream->clock_written = 0;
-        stream->pa_offs_bytes = stream->lcl_offs_bytes = 0;
+        stream->lcl_offs_bytes = 0;
         stream->held_bytes = 0;
-        __atomic_store_n(&stream->pa_held_bytes, 0, __ATOMIC_RELEASE);
     }
     else
     {
         ACPacket *p;
         stream->clock_written += stream->held_bytes;
         stream->held_bytes = 0;
-        stream->cap_read_offs = 0;
-        __atomic_store_n(&stream->cap_held_bytes, 0, __ATOMIC_RELEASE);
+        /* Stop's set_active(false) barrier drained the callback, so the slots
+         * are quiescent here and can be reset without an exchange. */
+        for (i = 0; i < stream->cap_n_slots; i++)
+        {
+            stream->cap_slots[i].word = CAP_WORD(0, CAP_FREE);
+            stream->cap_slots[i].disc = FALSE;
+        }
+        stream->cap_w_slot = 0;
+        stream->cap_w_fill = 0;
+        stream->cap_w_seq = 0;
+        stream->cap_filling = FALSE;
+        stream->cap_lost = FALSE;
+        stream->cap_next_seq = 0;
 
         if ((p = stream->locked_ptr))
         {
@@ -2690,12 +3225,32 @@ static NTSTATUS pipewire_release_render_buffer(void *args)
         pipewire_wrap_buffer(stream, buffer, written_bytes);
 
     stream->held_bytes += written_bytes;
-    if (__atomic_add_fetch(&stream->pa_held_bytes, written_bytes, __ATOMIC_RELEASE) > stream->real_bufsize_bytes)
+    /* Resync before publishing.  Adding first would briefly expose an
+     * overfull pa_held_bytes, and the process callback would consume that
+     * many bytes against a stale pa_offs_bytes before the repair landed. */
+    if (__atomic_load_n(&stream->pa_held_bytes, __ATOMIC_RELAXED) + written_bytes >
+        stream->real_bufsize_bytes)
     {
+        int res;
+
         WARN("%p PipeWire buffer overflow.\n", stream);
-        stream->pa_offs_bytes = stream->lcl_offs_bytes;
-        __atomic_store_n(&stream->pa_held_bytes, stream->held_bytes, __ATOMIC_RELEASE);
+        if ((res = stream_loop_locked(stream, do_resync_ring)) < 0)
+        {
+            /* Without the repair the read cursor does not describe the ring,
+             * so publishing would hand the callback a byte count its offset
+             * does not match.  Take the write back instead: the bytes stay
+             * unpublished for the next GetBuffer to overwrite, which loses
+             * this buffer but leaves every cursor as it was on entry. */
+            stream->held_bytes -= written_bytes;
+            ring_op_failed(stream, RING_OP_RESYNC, "the render ring overflow repair", res);
+            stream->locked = 0;
+            pw_thread_loop_unlock(pw_loop_global);
+            params->result = ring_op_hresult(res);
+            return STATUS_SUCCESS;
+        }
     }
+    else
+        __atomic_add_fetch(&stream->pa_held_bytes, written_bytes, __ATOMIC_RELEASE);
     stream->clock_written += written_bytes;
     stream->locked = 0;
 
@@ -2854,6 +3409,12 @@ static NTSTATUS pipewire_get_next_packet_size(void *args)
     struct pipewire_stream *stream = handle_get_stream(params->stream);
 
     pw_thread_loop_lock(pw_loop_global);
+    if (!stream_valid(stream))
+    {
+        pw_thread_loop_unlock(pw_loop_global);
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+        return STATUS_SUCCESS;
+    }
     pipewire_capture_padding(stream);
     if (stream->locked_ptr)
         *params->frames = stream->period_bytes / stream->frame_size;
@@ -2929,8 +3490,11 @@ static NTSTATUS pipewire_set_volumes(void *args)
     pw_thread_loop_lock(pw_loop_global);
     if (stream_valid(stream))
         for (i = 0; i < stream->info.channels; i++)
-            stream->vol[i] = params->volumes[i] * params->master_volume *
-                             params->session_volumes[i];
+        {
+            float v = params->volumes[i] * params->master_volume *
+                      params->session_volumes[i];
+            __atomic_store(&stream->vol[i], &v, __ATOMIC_RELEASE);
+        }
     pw_thread_loop_unlock(pw_loop_global);
     return STATUS_SUCCESS;
 }
@@ -2964,6 +3528,7 @@ static NTSTATUS pipewire_set_sample_rate(void *args)
     HRESULT hr = S_OK;
     float ratio;
     SIZE_T period_bytes;
+    int rc;
 
     TRACE("stream %p rate %u.\n", stream, (unsigned)params->rate);
     pw_thread_loop_lock(pw_loop_global);
@@ -2975,6 +3540,11 @@ static NTSTATUS pipewire_set_sample_rate(void *args)
     if (stream->dataflow != eRender)
     {
         hr = E_NOTIMPL;
+        goto exit;
+    }
+    if (stream->locked)
+    {
+        hr = AUDCLNT_E_BUFFER_OPERATION_PENDING;
         goto exit;
     }
 
@@ -2998,10 +3568,30 @@ static NTSTATUS pipewire_set_sample_rate(void *args)
         goto exit;
     }
 
+    /* Empty the ring before changing the rate.  The control cannot be put
+     * back once set, so the step that can fail comes first: if the read
+     * cursor cannot be reached, nothing has moved and the stream is still
+     * coherent at the old rate.
+     *
+     * The storage is deliberately not cleared: occupancy zero already makes
+     * the callback emit silence and GetBuffer silences what it hands out, so
+     * clearing bytes the callback may be reading would race for no gain. */
+    if ((rc = stream_loop_locked(stream, do_reset_ring)) < 0)
+    {
+        ring_op_failed(stream, RING_OP_RATE, "the render ring reset for a rate change", rc);
+        hr = ring_op_hresult(rc);
+        goto exit;
+    }
+    stream->clock_lastpos = stream->clock_written = 0;
+    stream->lcl_offs_bytes = 0;
+    stream->held_bytes = 0;
+
     ratio = params->rate / (float)stream->rate_connected;
     if (pw_stream_set_control(stream->pw, SPA_PROP_rate, 1, &ratio, 0) < 0)
     {
-        /* needs PipeWire >= 1.2.6 and an active adaptive resampler */
+        /* needs PipeWire >= 1.2.6 and an active adaptive resampler.  The ring
+         * is empty and every cursor agrees on that, so the stream is coherent
+         * at the old rate; only the buffered audio is gone. */
         WARN("pw_stream_set_control(rate) failed for stream %p.\n", stream);
         hr = E_NOTIMPL;
         goto exit;
@@ -3009,14 +3599,8 @@ static NTSTATUS pipewire_set_sample_rate(void *args)
 
     pw_stream_flush(stream->pw, false);
 
-    stream->clock_lastpos = stream->clock_written = 0;
-    stream->pa_offs_bytes = stream->lcl_offs_bytes = 0;
-    stream->held_bytes = 0;
-    __atomic_store_n(&stream->pa_held_bytes, 0, __ATOMIC_RELEASE);
     stream->period_bytes = period_bytes;
     stream->info.rate = params->rate;
-
-    silence_buffer(stream->info.format, stream->local_buffer, stream->real_bufsize_bytes);
 
 exit:
     pw_thread_loop_unlock(pw_loop_global);
