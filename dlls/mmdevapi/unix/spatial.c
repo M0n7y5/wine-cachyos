@@ -95,6 +95,7 @@ typedef struct {
 } IPLBinauralEffectParams;
 
 #define STEAMAUDIO_VERSION ((4u << 16) | (8u << 8) | 1u)
+#define IPL_AUDIOEFFECTSTATE_TAILCOMPLETE 1
 
 static int (*p_iplContextCreate)(IPLContextSettings *, IPLContext *);
 static void (*p_iplContextRelease)(IPLContext *);
@@ -156,6 +157,7 @@ struct spatial_engine
     IPLHRTF hrtf;
     IPLAudioSettings audio;
     IPLBinauralEffect effects[SPATIAL_MAX_SLOTS];
+    unsigned char tail_pending[SPATIAL_MAX_SLOTS]; /* skipping a live tail clicks */
     float *scratch;     /* 2 * frames, deinterleaved L then R */
     int bass_on;        /* WINE_SPATIAL_BASS one-pole low-shelf active */
     float bass_g;       /* LF gain, 0..1 (1 = unchanged) */
@@ -264,6 +266,7 @@ static NTSTATUS spatial_object_add(void *args)
         return STATUS_NOT_SUPPORTED;
     }
 
+    engine->tail_pending[i] = 0;
     params->slot = i;
     return STATUS_SUCCESS;
 }
@@ -278,6 +281,15 @@ static NTSTATUS spatial_object_remove(void *args)
     p_iplBinauralEffectRelease(&engine->effects[params->slot]);
     engine->effects[params->slot] = NULL;
     return STATUS_SUCCESS;
+}
+
+static int buffer_is_silent(const float *p, UINT frames)
+{
+    UINT i;
+
+    for (i = 0; i < frames; i++)
+        if (p[i] != 0.0f) return 0;
+    return 1;
 }
 
 static NTSTATUS spatial_mix(void *args)
@@ -298,8 +310,13 @@ static NTSTATUS spatial_mix(void *args)
         float *in_data = (float *)(UINT_PTR)objs[i].buffer;
         float *out_data[2];
         float len;
+        int silent, state;
 
         if (objs[i].slot >= SPATIAL_MAX_SLOTS || !engine->effects[objs[i].slot])
+            continue;
+
+        silent = buffer_is_silent(in_data, params->frames);
+        if (silent && !engine->tail_pending[objs[i].slot])
             continue;
 
         len = sqrtf(objs[i].pos[0] * objs[i].pos[0] +
@@ -334,7 +351,9 @@ static NTSTATUS spatial_mix(void *args)
         out.numSamples = params->frames;
         out.data = out_data;
 
-        p_iplBinauralEffectApply(engine->effects[objs[i].slot], &effect_params, &in, &out);
+        state = p_iplBinauralEffectApply(engine->effects[objs[i].slot], &effect_params, &in, &out);
+        engine->tail_pending[objs[i].slot] =
+                !silent || state != IPL_AUDIOEFFECTSTATE_TAILCOMPLETE;
 
         for (f = 0; f < params->frames; f++)
         {
