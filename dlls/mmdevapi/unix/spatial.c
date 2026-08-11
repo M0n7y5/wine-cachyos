@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 #include <dlfcn.h>
 #include <pthread.h>
 
@@ -175,6 +176,12 @@ static NTSTATUS spatial_init(void *args)
     pthread_once(&phonon_once, phonon_load);
     if (!phonon_handle) return STATUS_NOT_SUPPORTED;
 
+    /* IPLAudioSettings takes both as int, and scratch is 2 * frames floats;
+     * the size_t cast below is not enough on a 32-bit unix side */
+    if (!params->frames || !params->rate || params->rate > INT_MAX ||
+        params->frames > INT_MAX / (UINT)(2 * sizeof(float)))
+        return STATUS_INVALID_PARAMETER;
+
     if (!(engine = calloc(1, sizeof(*engine)))) return STATUS_NO_MEMORY;
     if (!(engine->scratch = calloc(2 * (size_t)params->frames, sizeof(float))))
     {
@@ -212,8 +219,12 @@ static NTSTATUS spatial_init(void *args)
         float fc = hz && hz[0] ? (float)atof(hz) : 500.0f;
         float g = bass && bass[0] ? (float)atof(bass) : 0.48f; /* default-on; WINE_SPATIAL_BASS=1 disables */
 
-        if (g < 0.0f) g = 0.0f;
+        /* the one-pole state persists across mix calls, so a NaN or a negative
+         * coefficient would poison every later sample; NaN fails every ordered
+         * compare, hence the negated forms */
+        if (!(g >= 0.0f)) g = 0.0f;
         if (g > 1.0f) g = 1.0f;
+        if (!(fc > 0.0f) || fc > (float)params->rate * 0.5f) fc = 500.0f;
         engine->bass_g = g;
         engine->bass_a = 2.0f * 3.14159265358979f * fc / (float)params->rate;
         if (engine->bass_a > 1.0f) engine->bass_a = 1.0f;
