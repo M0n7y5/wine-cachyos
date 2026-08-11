@@ -56,7 +56,7 @@ static UINT get_spatial_dynamic_budget(void)
     /* an over-long env value or an empty registry value leaves buf untouched
      * while still reporting success */
     WCHAR buf[16] = {0};
-    DWORD size = sizeof(buf);
+    DWORD size = sizeof(buf), type = REG_NONE;
     HKEY key;
     BOOL enabled = FALSE;
     const char *source = "registry";
@@ -65,8 +65,18 @@ static UINT get_spatial_dynamic_budget(void)
         enabled = spatial_option_enabled(buf);
         source = "environment";
     }else if(RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Wine\\mmdevapi", &key) == ERROR_SUCCESS){
-        if(RegQueryValueExW(key, L"SpatialSound", 0, NULL, (BYTE*)buf, &size) == ERROR_SUCCESS)
-            enabled = spatial_option_enabled(buf);
+        if(RegQueryValueExW(key, L"SpatialSound", 0, &type, (BYTE*)buf, &size) == ERROR_SUCCESS){
+            if(type == REG_SZ || type == REG_EXPAND_SZ){
+                enabled = spatial_option_enabled(buf);
+            }else if(type == REG_DWORD && size == sizeof(DWORD)){
+                /* a DWORD reads as L"\x0001" as a string, which is neither
+                 * "1" nor "y", so it would otherwise silently mean "off" */
+                DWORD value;
+                memcpy(&value, buf, sizeof(value));
+                enabled = value != 0;
+            }else
+                WARN("Ignoring SpatialSound of type %lu.\n", type);
+        }
         RegCloseKey(key);
     }
 
