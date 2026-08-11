@@ -54,7 +54,9 @@ static BOOL spatial_option_enabled(const WCHAR *value)
 
 static UINT get_spatial_dynamic_budget(void)
 {
-    WCHAR buf[16];
+    /* an over-long env value or an empty registry value leaves buf untouched
+     * while still reporting success */
+    WCHAR buf[16] = {0};
     DWORD size = sizeof(buf);
     HKEY key;
     BOOL enabled = FALSE;
