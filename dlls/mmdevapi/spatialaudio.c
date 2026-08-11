@@ -150,6 +150,10 @@ struct SpatialAudioObjectImpl {
 
     BOOL invalidated;
     BOOL updated;
+    /* SetEndOfStream invalidates the object for the caller at once, but its
+     * last buffer still owes one pass through the mixer */
+    BOOL eos_pending;
+    UINT32 eos_frames;
 
     float pos[3];
     float volume;
@@ -318,6 +322,18 @@ static HRESULT WINAPI SAO_SetEndOfStream(ISpatialAudioObject *iface, UINT32 fram
         return SPTLAUDCLNT_E_OUT_OF_ORDER;
     }
 
+    if(frames > This->sa_stream->update_frames){
+        WARN("End of stream past the buffer: %u of %u frames.\n",
+                frames, This->sa_stream->update_frames);
+        frames = This->sa_stream->update_frames;
+    }
+
+    /* the caller sees an invalidated object from here on, but the frames it
+     * just wrote are part of the stream and are mixed once more */
+    if(!This->invalidated){
+        This->eos_frames = frames;
+        This->eos_pending = TRUE;
+    }
     This->invalidated = TRUE;
 
     LeaveCriticalSection(&This->sa_stream->lock);
@@ -797,8 +813,12 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
         if(!spatial_stats.started) spatial_stats_start();
 
         LIST_FOR_EACH_ENTRY(object, &This->objects, SpatialAudioObjectImpl, entry){
-            if(object->invalidated)
+            if(object->invalidated && !object->eos_pending)
                 continue;
+            /* frames past the end of the stream are not part of it */
+            if(object->eos_pending && object->eos_frames < This->update_frames)
+                memset(object->buf + object->eos_frames, 0,
+                        (This->update_frames - object->eos_frames) * sizeof(float));
             if(This->engine && object->engine_slot != ~0 &&
                     mix_count < SPATIAL_MAX_SLOTS){
                 mix_objs[mix_count].buffer = (UINT_PTR)object->buf;
@@ -836,7 +856,8 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
             }else{
                 /* engine refused the tick, fall back to panning */
                 LIST_FOR_EACH_ENTRY(object, &This->objects, SpatialAudioObjectImpl, entry){
-                    if(!object->invalidated && object->engine_slot != ~0)
+                    if((!object->invalidated || object->eos_pending) &&
+                            object->engine_slot != ~0)
                         mix_dynamic_object(This, object);
                 }
             }
@@ -847,6 +868,7 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
         LIST_FOR_EACH_ENTRY(object, &This->objects, SpatialAudioObjectImpl, entry){
             if(!object->updated)
                 object->invalidated = TRUE;
+            object->eos_pending = FALSE;
         }
 
         hr = IAudioRenderClient_ReleaseBuffer(This->render, This->update_frames, 0);
