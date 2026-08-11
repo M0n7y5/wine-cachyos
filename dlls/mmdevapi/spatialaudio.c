@@ -770,7 +770,12 @@ static DWORD WINAPI spatial_stats_writer(void *arg)
 static void spatial_stats_start(void)
 {
     HANDLE t;
+    HMODULE mod;
     if(InterlockedCompareExchange(&spatial_stats.started, 2, 0) != 0) return;
+    /* the writer runs until the process exits, so the module it returns into
+     * must stay mapped */
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            (const WCHAR *)spatial_stats_writer, &mod);
     if(spatial_stats_dos_path(spatial_stats.path, ARRAY_SIZE(spatial_stats.path)) &&
             (t = CreateThread(NULL, 0, spatial_stats_writer, NULL, 0, NULL))){
         CloseHandle(t);
