@@ -83,14 +83,20 @@ static BOOL spatial_unix_init(void)
     return !status;
 }
 
+/* Index of a static bed channel in static_object_map[], or ~0 for anything
+ * that has no channel: None, Dynamic, a multi-bit value, or a bit above
+ * BackCenter. The argument is app-supplied, and AudioObjectType is signed, so
+ * neither the range nor the shift can be left to chance. */
 static UINT32 AudioObjectType_to_index(AudioObjectType type)
 {
-    UINT32 o = 0;
-    while(type){
-        type >>= 1;
+    UINT32 bits = type, o = 0;
+
+    if(bits < AudioObjectType_FrontLeft || bits > AudioObjectType_BackCenter ||
+            (bits & (bits - 1)))
+        return ~0;
+    while(bits >>= 1)
         ++o;
-    }
-    return o - 2;
+    return o - 1;
 }
 
 static const char *debugstr_fmtex(const WAVEFORMATEX *fmt)
@@ -870,9 +876,15 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
         }
     }else if(type & ~This->params.StaticObjectTypeMask){
         return SPTLAUDCLNT_E_STATIC_OBJECT_NOT_AVAILABLE;
-    }else{
+    }else if(type != AudioObjectType_None){
+        UINT32 idx = AudioObjectType_to_index(type);
+
+        /* StaticObjectTypeMask is app-supplied and unfiltered, so it can admit
+         * a type that maps to no bed channel */
+        if(idx == ~0)
+            return SPTLAUDCLNT_E_STATIC_OBJECT_NOT_AVAILABLE;
         LIST_FOR_EACH_ENTRY(obj, &This->objects, SpatialAudioObjectImpl, entry){
-            if(obj->static_idx == AudioObjectType_to_index(type))
+            if(obj->static_idx == idx)
                 return SPTLAUDCLNT_E_OBJECT_ALREADY_ACTIVE;
         }
     }
