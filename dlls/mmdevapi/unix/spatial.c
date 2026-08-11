@@ -185,7 +185,8 @@ static NTSTATUS spatial_init(void *args)
 
     memset(&ctx_settings, 0, sizeof(ctx_settings));
     ctx_settings.version = STEAMAUDIO_VERSION;
-    ctx_settings.simdLevel = 4; /* allow up to AVX512 */
+    /* AVX512 measures no faster than AVX2 here and can downclock the core. */
+    ctx_settings.simdLevel = 3; /* IPL_SIMDLEVEL_AVX2 */
     if (p_iplContextCreate(&ctx_settings, &engine->ctx))
     {
         WARN("iplContextCreate failed.\n");
