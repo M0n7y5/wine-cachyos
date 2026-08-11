@@ -1267,9 +1267,8 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
     if(IsEqualIID(riid, &IID_ISpatialAudioObjectRenderStream)){
         SpatialAudioStreamImpl *obj;
 
-        if(prop &&
-                (prop->vt != VT_BLOB ||
-                 prop->blob.cbSize != sizeof(SpatialAudioObjectRenderStreamActivationParams))){
+        if(!prop || prop->vt != VT_BLOB || !prop->blob.pBlobData ||
+                prop->blob.cbSize != sizeof(SpatialAudioObjectRenderStreamActivationParams)){
             WARN("Got invalid params\n");
             *stream = NULL;
             return E_INVALIDARG;
