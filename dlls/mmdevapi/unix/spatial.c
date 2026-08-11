@@ -109,6 +109,11 @@ static void (*p_iplBinauralEffectRelease)(IPLBinauralEffect *);
 static pthread_once_t phonon_once = PTHREAD_ONCE_INIT;
 static void *phonon_handle;
 
+/* phonon.h documents iplHRTFCreate as not thread-safe, and two streams can
+ * initialise at once. Held across the paired release too, since the same
+ * objects are being torn down. */
+static pthread_mutex_t engine_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void phonon_load(void)
 {
     const char *path = getenv("WINE_SPATIAL_PHONON");
@@ -198,8 +203,10 @@ static NTSTATUS spatial_init(void *args)
     ctx_settings.version = STEAMAUDIO_VERSION;
     /* AVX512 measures no faster than AVX2 here and can downclock the core. */
     ctx_settings.simdLevel = 3; /* IPL_SIMDLEVEL_AVX2 */
+    pthread_mutex_lock(&engine_lock);
     if (p_iplContextCreate(&ctx_settings, &engine->ctx))
     {
+        pthread_mutex_unlock(&engine_lock);
         WARN("iplContextCreate failed.\n");
         goto fail;
     }
@@ -209,9 +216,11 @@ static NTSTATUS spatial_init(void *args)
     hrtf_settings.volume = 1.0f;
     if (p_iplHRTFCreate(engine->ctx, &engine->audio, &hrtf_settings, &engine->hrtf))
     {
+        pthread_mutex_unlock(&engine_lock);
         WARN("iplHRTFCreate failed.\n");
         goto fail;
     }
+    pthread_mutex_unlock(&engine_lock);
 
     {
         const char *bass = getenv("WINE_SPATIAL_BASS");
@@ -240,7 +249,12 @@ static NTSTATUS spatial_init(void *args)
     return STATUS_SUCCESS;
 
 fail:
-    if (engine->ctx) p_iplContextRelease(&engine->ctx);
+    if (engine->ctx)
+    {
+        pthread_mutex_lock(&engine_lock);
+        p_iplContextRelease(&engine->ctx);
+        pthread_mutex_unlock(&engine_lock);
+    }
     free(engine->scratch);
     free(engine);
     return STATUS_NOT_SUPPORTED;
@@ -254,8 +268,10 @@ static NTSTATUS spatial_release(void *args)
 
     for (i = 0; i < SPATIAL_MAX_SLOTS; i++)
         if (engine->effects[i]) p_iplBinauralEffectRelease(&engine->effects[i]);
+    pthread_mutex_lock(&engine_lock);
     p_iplHRTFRelease(&engine->hrtf);
     p_iplContextRelease(&engine->ctx);
+    pthread_mutex_unlock(&engine_lock);
     free(engine->scratch);
     free(engine);
     return STATUS_SUCCESS;
