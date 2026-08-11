@@ -45,7 +45,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(mmdevapi);
 WINE_DECLARE_DEBUG_CHANNEL(spatial);
 
 #define SPATIAL_MAX_DYNAMIC_OBJECTS 112  /* matches Windows Sonic for Headphones */
-#define SPATIAL_MAX_MIX_OBJECTS (SPATIAL_MAX_DYNAMIC_OBJECTS + 16)  /* dynamic objects + up to 16 static bed channels */
 
 static BOOL spatial_option_enabled(const WCHAR *value)
 {
@@ -792,7 +791,7 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
     }
 
     if(This->update_frames > 0){
-        struct spatial_mix_object mix_objs[SPATIAL_MAX_MIX_OBJECTS];
+        struct spatial_mix_object mix_objs[SPATIAL_MAX_SLOTS];
         UINT32 mix_count = 0, i;
 
         if(!spatial_stats.started) spatial_stats_start();
@@ -801,7 +800,7 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
             if(object->invalidated)
                 continue;
             if(This->engine && object->engine_slot != ~0 &&
-                    mix_count < SPATIAL_MAX_MIX_OBJECTS){
+                    mix_count < SPATIAL_MAX_SLOTS){
                 mix_objs[mix_count].buffer = (UINT_PTR)object->buf;
                 mix_objs[mix_count].slot = object->engine_slot;
                 memcpy(mix_objs[mix_count].pos, object->pos, sizeof(object->pos));

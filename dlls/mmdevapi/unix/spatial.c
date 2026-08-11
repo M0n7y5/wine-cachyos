@@ -149,9 +149,11 @@ fail:
     phonon_handle = NULL;
 }
 
-#define SPATIAL_MAX_SLOTS 128
-
-/* Calls are serialized by the PE-side stream lock; no locking here. */
+/* One engine per stream, and the PE side holds the stream lock across every
+ * call that touches it, so access is exclusive per engine and nothing here
+ * locks. Two streams do run concurrently: keep this struct free of shared
+ * state, and note that init and release are exclusive by construction (the
+ * stream is unpublished and refcount-zero respectively) rather than by lock. */
 struct spatial_engine
 {
     IPLContext ctx;
@@ -312,7 +314,9 @@ static NTSTATUS spatial_mix(void *args)
     float *out_r = (float *)(UINT_PTR)params->out_r;
     unsigned int i, f;
 
-    if (params->frames != (UINT)engine->audio.frameSize) return STATUS_INVALID_PARAMETER;
+    if (params->frames != (UINT)engine->audio.frameSize ||
+        params->count > SPATIAL_MAX_SLOTS)
+        return STATUS_INVALID_PARAMETER;
 
     for (i = 0; i < params->count; i++)
     {

@@ -52,6 +52,10 @@ struct spatial_object_remove_params
     UINT slot;
 };
 
+/* Engine effect slots. Every mix entry needs one, so this also bounds the
+ * object array the PE side sends to spatial_mix. */
+#define SPATIAL_MAX_SLOTS 128
+
 struct spatial_mix_object
 {
     UINT64 buffer;   /* mono float[frames] */
