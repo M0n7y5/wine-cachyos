@@ -254,14 +254,14 @@ static ULONG WINAPI SAO_Release(ISpatialAudioObject *iface)
     if(!ref){
         EnterCriticalSection(&This->sa_stream->lock);
         list_remove(&This->entry);
-        if(This->type == AudioObjectType_Dynamic){
+        if(This->type == AudioObjectType_Dynamic)
             This->sa_stream->dyn_live--;
-            if(This->sa_stream->engine && This->engine_slot != ~0){
-                struct spatial_object_remove_params params;
-                params.handle = This->sa_stream->engine;
-                params.slot = This->engine_slot;
-                WINE_UNIX_CALL(unix_spatial_object_remove, &params);
-            }
+        /* bed channels take a slot too when the bed is virtualized */
+        if(This->sa_stream->engine && This->engine_slot != ~0){
+            struct spatial_object_remove_params params;
+            params.handle = This->sa_stream->engine;
+            params.slot = This->engine_slot;
+            WINE_UNIX_CALL(unix_spatial_object_remove, &params);
         }
         LeaveCriticalSection(&This->sa_stream->lock);
 
