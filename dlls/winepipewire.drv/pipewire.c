@@ -319,11 +319,20 @@ static struct list g_streams = LIST_INIT(g_streams); /* loop-lock protected */
 
 static pthread_mutex_t pw_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* device_lists_mutex covers both lists, both default names, and every field
+ * of the pw_phys_device entries they hold.  test_connect rebuilds them while
+ * unix calls may already be reading; mmdevapi happens to enumerate only after
+ * the single test_connect, but nothing here enforces that and the entries are
+ * freed, not just replaced.  It is a leaf: no code holding it takes the loop
+ * lock, so the one path that reaches a reader under the loop lock stays
+ * deadlock free. */
+static pthread_mutex_t device_lists_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct list g_render_devices = LIST_INIT(g_render_devices);
 static struct list g_capture_devices = LIST_INIT(g_capture_devices);
-static struct list active_periods = LIST_INIT(active_periods);
 static char g_default_sink[256];
 static char g_default_source[256];
+
+static struct list active_periods = LIST_INIT(active_periods); /* loop-lock protected */
 
 /* ----------------------------------------------------------------------
  * Small helpers
@@ -802,6 +811,10 @@ static struct pw_phys_device *add_device(struct list *list, const char *pw_name,
     return dev;
 }
 
+/* Callers hold device_lists_mutex, except pipewire_process_detach, which
+ * deliberately takes nothing: it can run at process exit with the probe
+ * thread already killed, possibly mid-hold, and blocking there would hang
+ * teardown.  Same reason that path takes no loop lock and skips pw_deinit. */
 static void free_device_lists(void)
 {
     static struct list *const lists[] = { &g_render_devices, &g_capture_devices, NULL };
@@ -1766,10 +1779,12 @@ static NTSTATUS pipewire_test_connect(void *args)
     struct probe_device *pd, *pdnext;
     BOOL failed;
 
+    pthread_mutex_lock(&device_lists_mutex);
     free_device_lists();
     list_init(&g_render_devices);
     list_init(&g_capture_devices);
     g_default_sink[0] = g_default_source[0] = '\0';
+    pthread_mutex_unlock(&device_lists_mutex);
 
     params->priority = Priority_Unavailable;
 
@@ -1836,8 +1851,15 @@ static NTSTATUS pipewire_test_connect(void *args)
     if (failed)
         WARN("PipeWire core reported an error during the probe\n");
     else
+    {
         /* The pw loop is fully stopped: safe to do Wine string conversion. */
+        pthread_mutex_lock(&device_lists_mutex);
         build_device_cache(&p);
+        TRACE("probe for %s: %u sinks default=%s, %u sources default=%s, rate=%u\n",
+              debugstr_w(params->name), list_count(&g_render_devices), debugstr_a(g_default_sink),
+              list_count(&g_capture_devices), debugstr_a(g_default_source), p.clock_rate);
+        pthread_mutex_unlock(&device_lists_mutex);
+    }
 
     LIST_FOR_EACH_ENTRY_SAFE(pn, next, &p.nodes, struct probe_node, entry)
     {
@@ -1856,10 +1878,6 @@ static NTSTATUS pipewire_test_connect(void *args)
     if (failed)
         return STATUS_SUCCESS;
 
-    TRACE("probe for %s: %u sinks default=%s, %u sources default=%s, rate=%u\n",
-          debugstr_w(params->name), list_count(&g_render_devices), debugstr_a(g_default_sink),
-          list_count(&g_capture_devices), debugstr_a(g_default_source), p.clock_rate);
-
     params->priority = Priority_Preferred;
     return STATUS_SUCCESS;
 }
@@ -1877,6 +1895,7 @@ static NTSTATUS pipewire_get_endpoint_ids(void *args)
     unsigned int offset;
     struct pw_phys_device *dev;
 
+    pthread_mutex_lock(&device_lists_mutex);
     params->num = list_count(list);
     offset = needed = params->num * sizeof(*params->endpoints);
 
@@ -1897,6 +1916,7 @@ static NTSTATUS pipewire_get_endpoint_ids(void *args)
             endpoint++;
         }
     }
+    pthread_mutex_unlock(&device_lists_mutex);
     params->default_idx = 0;
 
     if (needed > params->size)
@@ -1911,7 +1931,10 @@ static NTSTATUS pipewire_get_endpoint_ids(void *args)
 
 /* Resolve a device string to its cache entry.  A loopback capture targets a
  * render sink, so an eCapture lookup that misses the capture list falls back
- * to the render list (the sink's format/period describe the loopback). */
+ * to the render list (the sink's format/period describe the loopback).
+ *
+ * Called with device_lists_mutex held, and the entry stays valid only while
+ * the caller keeps holding it. */
 static struct pw_phys_device *find_device(EDataFlow flow, const char *name)
 {
     struct list *list = (flow == eRender) ? &g_render_devices : &g_capture_devices;
@@ -1932,18 +1955,20 @@ static struct pw_phys_device *find_device(EDataFlow flow, const char *name)
 static NTSTATUS pipewire_get_mix_format(void *args)
 {
     struct get_mix_format_params *params = args;
-    struct pw_phys_device *dev = find_device(params->flow, params->device);
+    struct pw_phys_device *dev;
 
-    if (dev)
+    pthread_mutex_lock(&device_lists_mutex);
+    if ((dev = find_device(params->flow, params->device)))
     {
         *params->fmt = dev->fmt;
         params->result = S_OK;
     }
     else
-    {
-        WARN("device not found: flow %d %s.\n", params->flow, debugstr_a(params->device));
         params->result = E_FAIL;
-    }
+    pthread_mutex_unlock(&device_lists_mutex);
+
+    if (!dev)
+        WARN("device not found: flow %d %s.\n", params->flow, debugstr_a(params->device));
     return STATUS_SUCCESS;
 }
 
@@ -1955,12 +1980,17 @@ static HRESULT get_device_period_helper(EDataFlow flow, const char *pw_name,
     if (!def && !min)
         return E_POINTER;
 
+    pthread_mutex_lock(&device_lists_mutex);
     if (!(dev = find_device(flow, pw_name)))
+    {
+        pthread_mutex_unlock(&device_lists_mutex);
         return E_FAIL;
+    }
     if (def)
         *def = dev->def_period;
     if (min)
         *min = dev->min_period;
+    pthread_mutex_unlock(&device_lists_mutex);
     return S_OK;
 }
 
@@ -2039,17 +2069,18 @@ static NTSTATUS pipewire_get_prop_value(void *args)
         {0xb3f8fa53, 0x0004, 0x438e, {0x90, 0x03, 0x51, 0xa4, 0x6e, 0x13, 0x9b, 0xfc}}, 2
     };
     struct get_prop_value_params *params = args;
-    struct pw_phys_device *dev = find_device(params->flow, params->device);
+    struct pw_phys_device *dev;
 
-    if (!dev)
+    pthread_mutex_lock(&device_lists_mutex);
+    if (!(dev = find_device(params->flow, params->device)))
     {
         params->result = E_FAIL;
-        return STATUS_SUCCESS;
+        goto done;
     }
     if (IsEqualPropertyKey(*params->prop, devicepath_key))
     {
         get_device_path(dev, params);
-        return STATUS_SUCCESS;
+        goto done;
     }
     if (IsEqualGUID(&params->prop->fmtid, &DEVPKEY_Device_ContainerId))
     {
@@ -2065,7 +2096,7 @@ static NTSTATUS pipewire_get_prop_value(void *args)
             *params->value->puuid = dev->container_id;
             params->result = S_OK;
         }
-        return STATUS_SUCCESS;
+        goto done;
     }
     if (IsEqualGUID(&params->prop->fmtid, &PKEY_AudioEndpoint_GUID))
     {
@@ -2075,7 +2106,7 @@ static NTSTATUS pipewire_get_prop_value(void *args)
             params->value->vt = VT_UI4;
             params->value->ulVal = dev->form;
             params->result = S_OK;
-            return STATUS_SUCCESS;
+            goto done;
         case 3:   /* PhysicalSpeakers */
             if (dev->channel_mask)
             {
@@ -2085,10 +2116,13 @@ static NTSTATUS pipewire_get_prop_value(void *args)
             }
             else
                 params->result = E_FAIL;
-            return STATUS_SUCCESS;
+            goto done;
         }
     }
     params->result = E_NOTIMPL;
+
+done:
+    pthread_mutex_unlock(&device_lists_mutex);
     return STATUS_SUCCESS;
 }
 
@@ -2603,6 +2637,7 @@ static BOOL stream_valid(struct pipewire_stream *stream)
     return st == PW_STREAM_STATE_PAUSED || st == PW_STREAM_STATE_STREAMING;
 }
 
+/* Called with device_lists_mutex held. */
 static BOOL device_is_sink(const char *device)
 {
     struct pw_phys_device *dev;
@@ -2748,9 +2783,11 @@ static void report_dispatch_mode(struct pipewire_stream *stream, BOOL rt_render)
             async ? async : "absent", (unsigned long long)dispatch_token);
 }
 
-/* Called with the loop lock held. */
+/* Called with the loop lock held.  capture_sink is resolved by the caller,
+ * before it takes that lock, because device_is_sink reads the device lists
+ * and no reader may run underneath the loop lock. */
 static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, const char *device,
-                                       const WCHAR *appname)
+                                       const WCHAR *appname, BOOL capture_sink)
 {
     struct pw_properties *props;
     uint8_t buffer[1024];
@@ -2793,8 +2830,7 @@ static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, const cha
     if (device && device[0])
         pw_properties_set(props, PW_KEY_TARGET_OBJECT, device);
     if (stream->dataflow == eCapture &&
-        ((stream->flags & AUDCLNT_STREAMFLAGS_LOOPBACK) ||
-         (device && device[0] && device_is_sink(device))))
+        ((stream->flags & AUDCLNT_STREAMFLAGS_LOOPBACK) || capture_sink))
         pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, "true");
 
     /* libpipewire copies this into media.name, which applets print next to
@@ -2976,6 +3012,7 @@ static NTSTATUS pipewire_create_stream(void *args)
     struct create_stream_params *params = args;
     struct pipewire_stream *stream;
     SIZE_T bufsize_bytes, size;
+    BOOL capture_sink;
     UINT32 i;
     HRESULT hr;
 
@@ -2996,6 +3033,14 @@ static NTSTATUS pipewire_create_stream(void *args)
         params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
         return STATUS_SUCCESS;
     }
+
+    /* Before the loop lock: device_is_sink reads the device lists, and
+     * holding the loop lock across a device_lists_mutex acquisition would be
+     * the only place a reader ran underneath it. */
+    pthread_mutex_lock(&device_lists_mutex);
+    capture_sink = params->flow == eCapture && params->device && params->device[0] &&
+                   device_is_sink(params->device);
+    pthread_mutex_unlock(&device_lists_mutex);
 
     pw_thread_loop_lock(pw_loop_global);
 
@@ -3079,7 +3124,7 @@ static NTSTATUS pipewire_create_stream(void *args)
         stream->bufsize_frames = (SIZE_T)frames;
     }
 
-    hr = pipewire_stream_connect(stream, params->device, params->name);
+    hr = pipewire_stream_connect(stream, params->device, params->name, capture_sink);
     if (FAILED(hr))
         goto exit;
 
@@ -4411,10 +4456,12 @@ static NTSTATUS pipewire_get_loopback_capture_device(void *args)
     /* Resolve the render device string to a concrete sink node name; an
      * empty string means the session-manager default sink.  create_stream
      * then sets PW_KEY_STREAM_CAPTURE_SINK for that name. */
+    pthread_mutex_lock(&device_lists_mutex);
     if (device && device[0])
     {
         if (!device_is_sink(device))
         {
+            pthread_mutex_unlock(&device_lists_mutex);
             WARN("loopback target %s is not a sink.\n", debugstr_a(device));
             params->result = E_FAIL;
             return STATUS_SUCCESS;
@@ -4427,12 +4474,14 @@ static NTSTATUS pipewire_get_loopback_capture_device(void *args)
     needed = strlen(sink) + 1;
     if (params->ret_device_len < needed || !params->ret_device)
     {
+        pthread_mutex_unlock(&device_lists_mutex);
         params->ret_device_len = needed;
         params->result = STATUS_BUFFER_TOO_SMALL;
         return STATUS_SUCCESS;
     }
     memcpy(params->ret_device, sink, needed);
-    TRACE("loopback capture from sink %s.\n", debugstr_a(sink));
+    pthread_mutex_unlock(&device_lists_mutex);
+    TRACE("loopback capture from sink %s.\n", debugstr_a(params->ret_device));
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
