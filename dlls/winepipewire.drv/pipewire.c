@@ -323,9 +323,11 @@ static pthread_mutex_t pw_init_mutex = PTHREAD_MUTEX_INITIALIZER;
  * of the pw_phys_device entries they hold.  test_connect rebuilds them while
  * unix calls may already be reading; mmdevapi happens to enumerate only after
  * the single test_connect, but nothing here enforces that and the entries are
- * freed, not just replaced.  It is a leaf: no code holding it takes the loop
- * lock, so the one path that reaches a reader under the loop lock stays
- * deadlock free. */
+ * freed, not just replaced.  No reader runs while the loop lock is held:
+ * pipewire_create_stream resolves its device_is_sink answer before taking
+ * that lock, which is why pipewire_stream_connect is handed capture_sink
+ * instead of looking it up.  Keep it that way and the two locks never
+ * nest. */
 static pthread_mutex_t device_lists_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct list g_render_devices = LIST_INIT(g_render_devices);
 static struct list g_capture_devices = LIST_INIT(g_capture_devices);
