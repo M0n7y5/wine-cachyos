@@ -1374,9 +1374,13 @@ static void on_probe_registry_global(void *data, uint32_t id, uint32_t permissio
         else
             return;
 
-        /* find_device returns the first match in a list, so a second node
-         * with this direction and name would enumerate but never be
-         * reachable.  Any local client can register one. */
+        /* Scoped per direction, deliberately: find_device searches the
+         * matching list first, so a sink and a source may share a name and
+         * both stay reachable, while a second node of the same direction
+         * would enumerate and never be reached.  Any local client can
+         * register one.  A source colliding with the monitor endpoint that
+         * build_device_cache synthesizes for a same-named sink is a
+         * different pairing and is not covered here. */
         LIST_FOR_EACH_ENTRY(dup, &p->nodes, struct probe_node, entry)
             if (dup->flow == flow && !strcmp(dup->node_name, node_name))
                 return;
