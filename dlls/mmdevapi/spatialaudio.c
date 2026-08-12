@@ -413,13 +413,23 @@ static HRESULT WINAPI SAO_SetVolume(ISpatialAudioObject *iface, float vol)
 
     TRACE("(%p)->(%f)\n", This, vol);
 
-    if(This->type != AudioObjectType_Dynamic){
-        FIXME("Volume on static objects not implemented.\n");
-        return SPTLAUDCLNT_E_PROPERTY_NOT_SUPPORTED;
+    /* Unlike SetPosition, the documented failures are only the two update
+     * cycle ones: volume applies to static objects too, and out of range
+     * values have no error code assigned, so they are stored as given. */
+    EnterCriticalSection(&This->sa_stream->lock);
+
+    if(This->sa_stream->update_frames == ~0){
+        LeaveCriticalSection(&This->sa_stream->lock);
+        return SPTLAUDCLNT_E_OUT_OF_ORDER;
     }
 
-    EnterCriticalSection(&This->sa_stream->lock);
+    if(This->invalidated){
+        LeaveCriticalSection(&This->sa_stream->lock);
+        return SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+    }
+
     This->volume = vol;
+
     LeaveCriticalSection(&This->sa_stream->lock);
 
     return S_OK;
@@ -642,17 +652,18 @@ static BOOL bed_object_position(AudioObjectType type, float pos[3])
 static void mix_lfe_object(SpatialAudioStreamImpl *stream, SpatialAudioObjectImpl *object)
 {
     float *in = object->buf, *out = stream->buf;
+    float g = 0.5f * object->volume;
     UINT32 nch = stream->stream_fmtex.Format.nChannels, i;
     for(i = 0; i < stream->update_frames; ++i){
-        out[stream->dyn_left]  += in[i] * 0.5f;
-        out[stream->dyn_right] += in[i] * 0.5f;
+        out[stream->dyn_left]  += in[i] * g;
+        out[stream->dyn_right] += in[i] * g;
         out += nch;
     }
 }
 
 static void mix_static_object(SpatialAudioStreamImpl *stream, SpatialAudioObjectImpl *object)
 {
-    float *in = object->buf, *out;
+    float *in = object->buf, *out, vol;
     UINT32 i;
     if(object->static_idx == ~0 ||
             stream->static_object_map[object->static_idx] == ~0){
@@ -660,8 +671,9 @@ static void mix_static_object(SpatialAudioStreamImpl *stream, SpatialAudioObject
         return;
     }
     out = stream->buf + stream->static_object_map[object->static_idx];
+    vol = object->volume;
     for(i = 0; i < stream->update_frames; ++i){
-        *out += *in;
+        *out += *in * vol;
         ++in;
         out += stream->stream_fmtex.Format.nChannels;
     }
