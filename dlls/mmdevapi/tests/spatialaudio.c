@@ -433,6 +433,9 @@ static void test_audio_object_buffers(void)
     hr = ISpatialAudioObject_SetEndOfStream(sao[0], 0);
     ok(hr == SPTLAUDCLNT_E_OUT_OF_ORDER, "Expected that ending the stream at this point won't be allowed: 0x%08lx\n", hr);
 
+    hr = ISpatialAudioObject_SetVolume(sao[0], 0.5f);
+    ok(hr == SPTLAUDCLNT_E_OUT_OF_ORDER, "Expected setting the volume at this point won't be allowed: 0x%08lx\n", hr);
+
     hr = WaitForSingleObject(event, 200);
     ok(hr == WAIT_OBJECT_0, "Expected event to be flagged: 0x%08lx\n", hr);
 
@@ -452,11 +455,20 @@ static void test_audio_object_buffers(void)
         hr = ISpatialAudioObject_GetBuffer(sao[i], &buffer, &buffer_length);
         ok(hr == S_OK, "Expected to be able to get buffers for audio object: 0x%08lx\n", hr);
 
+        hr = ISpatialAudioObject_SetVolume(sao[i], 0.5f);
+        ok(hr == S_OK, "Failed to set the volume of a static object: 0x%08lx\n", hr);
+
+        hr = ISpatialAudioObject_SetPosition(sao[i], 0.0f, 0.0f, -1.0f);
+        ok(hr == SPTLAUDCLNT_E_PROPERTY_NOT_SUPPORTED, "Expected positioning a static object to be unsupported: 0x%08lx\n", hr);
+
         hr = ISpatialAudioObject_SetEndOfStream(sao[i], 0);
         ok(hr == S_OK, "Failed to end the stream: 0x%08lx\n", hr);
 
         hr = ISpatialAudioObject_GetBuffer(sao[i], &buffer, &buffer_length);
         ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED, "Expected audio object to be invalidated: 0x%08lx\n", hr);
+
+        hr = ISpatialAudioObject_SetVolume(sao[i], 0.5f);
+        ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED, "Expected setting the volume of an invalidated object to fail: 0x%08lx\n", hr);
     }
 
     hr = ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(sas);
@@ -488,6 +500,79 @@ static void test_audio_object_buffers(void)
         ISpatialAudioObject_Release(sao[i]);
     }
 
+    ISpatialAudioObjectRenderStream_Release(sas);
+}
+
+static void test_dynamic_object_properties(void)
+{
+    UINT32 dyn_object_count, frame_count, buffer_length;
+    SpatialAudioObjectRenderStreamActivationParams activation_params;
+    ISpatialAudioObjectRenderStream *sas = NULL;
+    PROPVARIANT activation_params_prop;
+    ISpatialAudioObject *sao;
+    BYTE *buffer;
+    HRESULT hr;
+
+    if (!max_dyn_count)
+    {
+        skip("No dynamic object budget, Windows Sonic is not enabled\n");
+        return;
+    }
+
+    PropVariantInit(&activation_params_prop);
+    activation_params_prop.vt = VT_BLOB;
+    activation_params_prop.blob.cbSize = sizeof(activation_params);
+    activation_params_prop.blob.pBlobData = (BYTE*) &activation_params;
+
+    fill_activation_params(&activation_params);
+    activation_params.MinDynamicObjectCount = 1;
+    activation_params.MaxDynamicObjectCount = 1;
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop, &IID_ISpatialAudioObjectRenderStream, (void**)&sas);
+    ok(hr == S_OK, "Failed to activate spatial audio stream: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_Dynamic, &sao);
+    ok(hr == S_OK, "Failed to activate spatial audio object: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObjectRenderStream_Start(sas);
+    ok(hr == S_OK, "Failed to start spatial audio render stream: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObject_SetPosition(sao, 0.0f, 0.0f, -1.0f);
+    ok(hr == SPTLAUDCLNT_E_OUT_OF_ORDER, "Expected setting the position at this point won't be allowed: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObject_SetVolume(sao, 0.5f);
+    ok(hr == SPTLAUDCLNT_E_OUT_OF_ORDER, "Expected setting the volume at this point won't be allowed: 0x%08lx\n", hr);
+
+    hr = WaitForSingleObject(event, 200);
+    ok(hr == WAIT_OBJECT_0, "Expected event to be flagged: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(sas, &dyn_object_count, &frame_count);
+    ok(hr == S_OK, "Failed to begin updating audio objects: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObject_GetBuffer(sao, &buffer, &buffer_length);
+    ok(hr == S_OK, "Expected to be able to get a buffer for the audio object: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObject_SetPosition(sao, 0.0f, 0.0f, -1.0f);
+    ok(hr == S_OK, "Failed to set the position of a dynamic object: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObject_SetVolume(sao, 0.5f);
+    ok(hr == S_OK, "Failed to set the volume of a dynamic object: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObject_SetEndOfStream(sao, 0);
+    ok(hr == S_OK, "Failed to end the stream: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObject_SetPosition(sao, 0.0f, 0.0f, -1.0f);
+    ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED, "Expected setting the position of an invalidated object to fail: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObject_SetVolume(sao, 0.5f);
+    ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED, "Expected setting the volume of an invalidated object to fail: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(sas);
+    ok(hr == S_OK, "Failed to end updating audio objects: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObjectRenderStream_Stop(sas);
+    ok(hr == S_OK, "got %#lx.\n", hr);
+
+    ISpatialAudioObject_Release(sao);
     ISpatialAudioObjectRenderStream_Release(sas);
 }
 
@@ -538,6 +623,7 @@ START_TEST(spatialaudio)
     test_stream_activation();
     test_audio_object_activation();
     test_audio_object_buffers();
+    test_dynamic_object_properties();
 
     ISpatialAudioClient_Release(sac);
 
