@@ -387,9 +387,21 @@ static HRESULT WINAPI SAO_SetPosition(ISpatialAudioObject *iface, float x,
         return SPTLAUDCLNT_E_PROPERTY_NOT_SUPPORTED;
 
     EnterCriticalSection(&This->sa_stream->lock);
+
+    if(This->sa_stream->update_frames == ~0){
+        LeaveCriticalSection(&This->sa_stream->lock);
+        return SPTLAUDCLNT_E_OUT_OF_ORDER;
+    }
+
+    if(This->invalidated){
+        LeaveCriticalSection(&This->sa_stream->lock);
+        return SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+    }
+
     This->pos[0] = x;
     This->pos[1] = y;
     This->pos[2] = z;
+
     LeaveCriticalSection(&This->sa_stream->lock);
 
     return S_OK;
