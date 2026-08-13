@@ -251,7 +251,20 @@ static NTSTATUS spatial_init(void *args)
         const char *bass = getenv("WINE_SPATIAL_BASS");
         const char *gain = getenv("WINE_SPATIAL_BASS_GAIN");
         const char *hz = getenv("WINE_SPATIAL_BASS_HZ");
-        int on = !bass || !bass[0] || bass_env_on(bass);
+        /* Opt-in, because the artifact this corrects is a property of the
+         * material and not of anything measurable here.  Summing a bed through
+         * one HRTF per channel tilts the result toward the bass only when the
+         * channels are correlated: at 11 channels the tilt measures +10.79 dB
+         * on the same tone in every channel and -0.11 dB once each channel is
+         * decorrelated by its own delay, which is nearer real game content.
+         * A fixed -4.94 dB cannot straddle an 11 dB swing, and the two errors
+         * are not equally cheap.  Under-correcting leaves some boom on
+         * correlated bass; over-correcting takes five decibels off everything,
+         * which was reported by ear before it was measured and then came back
+         * negative in 11 of 11 decorrelated seeds.  The game mixed its own
+         * bass, so absent evidence that we are corrupting it, it passes
+         * through untouched. */
+        int on = bass && bass[0] && bass_env_on(bass);
         float fc = hz && hz[0] ? (float)atof(hz) : 500.0f;
         float g = gain && gain[0] ? (float)atof(gain) : 0.48f;
 
