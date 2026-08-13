@@ -190,6 +190,7 @@ struct SpatialAudioStreamImpl {
 
     UINT32 static_object_map[17];
     UINT32 dyn_max, dyn_live;
+    UINT32 hud_frames;   /* frames still owed before the next section B publish */
     BOOL virtualize_bed;
     UINT32 dyn_left, dyn_right;
 
@@ -207,6 +208,18 @@ struct SpatialAudioImpl {
     WAVEFORMATEXTENSIBLE object_fmtex;
     UINT dyn_budget;
 };
+
+/* Section B of the shared snapshot.  Exactly one stream publishes, because the
+ * snapshot holds one stream's worth of bed.  The WINE_SPATIAL_STATS text writer
+ * below is per-process, so with two spatial streams whichever one called
+ * EndUpdatingAudioObjects last in the period silently overwrote the other's
+ * channels.  Electing one stream makes which stream you are reading
+ * deterministic instead of a race, and a second stream is reported once so the
+ * remaining limitation is visible rather than silent.  Section A elects its
+ * period group the same way, for the same reason. */
+static SpatialAudioStreamImpl *hud_stream;
+static LONG hud_off;            /* the unix side found no snapshot; stop calling */
+static LONG hud_multi_warned;
 
 static inline SpatialAudioObjectImpl *impl_from_ISpatialAudioObject(ISpatialAudioObject *iface)
 {
@@ -501,6 +514,7 @@ static ULONG WINAPI SAORS_Release(ISpatialAudioObjectRenderStream *iface)
             ISpatialAudioObjectRenderStreamNotify_Release(This->params.NotifyObject);
         free((void*)This->params.ObjectFormat);
         CloseHandle(This->params.EventHandle);
+        InterlockedCompareExchangePointer((void **)&hud_stream, NULL, This);
         DeleteCriticalSection(&This->lock);
         ISpatialAudioClient_Release(&This->sa_client->ISpatialAudioClient_iface);
         free(This);
@@ -711,8 +725,8 @@ static struct {
     volatile LONG started;     /* 0 unstarted, 2 initializing, 1 running, -1 disabled */
     volatile LONG seq;         /* bumped each update; the writer uses it for liveness */
     WCHAR path[MAX_PATH];
-    float db[17];              /* per AudioObjectType_to_index dBFS */
-    BOOL present[17];
+    float db[SPATIAL_BED_MAX]; /* per AudioObjectType_to_index dBFS */
+    BOOL present[SPATIAL_BED_MAX];
     volatile LONG hrtf, bed, dyn_live, dyn_max;
 } spatial_stats;
 
@@ -772,7 +786,7 @@ static DWORD WINAPI spatial_stats_writer(void *arg)
                 spatial_stats.hrtf, spatial_stats.bed,
                 spatial_stats.dyn_live, spatial_stats.dyn_max);
         if(idle < 5){
-            for(i = 0; i < 17 && len < (int)sizeof(line) - 16; ++i)
+            for(i = 0; i < SPATIAL_BED_MAX && len < (int)sizeof(line) - 16; ++i)
                 if(spatial_stats.present[i])
                     len += snprintf(line + len, sizeof(line) - len, " %s:%.1f",
                             spatial_channel_name(i), spatial_stats.db[i]);
@@ -809,25 +823,88 @@ static void spatial_stats_start(void)
         InterlockedExchange(&spatial_stats.started, -1);
 }
 
+static BOOL spatial_hud_claim(SpatialAudioStreamImpl *stream)
+{
+    void *prev;
+
+    if(hud_off) return FALSE;
+    prev = InterlockedCompareExchangePointer((void **)&hud_stream, stream, NULL);
+    if(!prev || prev == stream) return TRUE;
+    if(!InterlockedExchange(&hud_multi_warned, 1))
+        WARN("More than one spatial stream is active; the snapshot follows %p only.\n", prev);
+    return FALSE;
+}
+
+/* 10 Hz, counted down in frames rather than off a clock so the audio thread
+ * reads no timer.  Publishing straight from the mix costs one unixlib
+ * transition per 100 ms and needs no thread of its own, and the values are
+ * consistent by construction because this runs under the stream lock that
+ * produced them.  Publishing every period instead would double the
+ * transitions on this path for freshness no reader asked for.
+ *
+ * The counter starts at 0, so a freshly elected stream publishes on its first
+ * update: waiting a tenth of a second first would leave a new stream reading
+ * "never published", and a stream that lives for less than that, which the
+ * churn probe produces by design, would never appear at all. */
+static BOOL spatial_hud_due(SpatialAudioStreamImpl *stream)
+{
+    UINT32 rate = stream->stream_fmtex.Format.nSamplesPerSec;
+
+    if(!rate || !spatial_hud_claim(stream)) return FALSE;
+    if(stream->hud_frames >= stream->update_frames){
+        stream->hud_frames -= stream->update_frames;
+        return FALSE;
+    }
+    stream->hud_frames = rate / 10;
+    return TRUE;
+}
+
+/* One dBFS pass feeds both sinks, so the text file and section B can never
+ * disagree and the audio thread never computes the levels twice. */
 static void spatial_stats_update(SpatialAudioStreamImpl *stream)
 {
+    struct spatial_hud_params hud;
     SpatialAudioObjectImpl *object;
+    BOOL want_file = spatial_stats.started == 1;
+    BOOL want_hud = spatial_hud_due(stream);
     int i;
-    if(spatial_stats.started != 1) return;
-    for(i = 0; i < 17; ++i) spatial_stats.present[i] = FALSE;
+
+    if(!want_file && !want_hud) return;
+
+    for(i = 0; i < SPATIAL_BED_MAX; ++i) hud.bed_db[i] = SPATIAL_DB_FLOOR;
+    hud.bed_mask = 0;
     LIST_FOR_EACH_ENTRY(object, &stream->objects, SpatialAudioObjectImpl, entry){
         if(object->invalidated || object->type == AudioObjectType_Dynamic ||
-                object->static_idx >= 17)
+                object->static_idx >= SPATIAL_BED_MAX)
             continue;
-        spatial_stats.db[object->static_idx] =
+        hud.bed_db[object->static_idx] =
                 spatial_channel_dbfs(object->buf, stream->update_frames);
-        spatial_stats.present[object->static_idx] = TRUE;
+        hud.bed_mask |= 1u << object->static_idx;
     }
-    spatial_stats.hrtf = stream->engine != 0;
-    spatial_stats.bed = stream->virtualize_bed;
-    spatial_stats.dyn_live = stream->dyn_live;
-    spatial_stats.dyn_max = stream->dyn_max;
-    InterlockedIncrement(&spatial_stats.seq);
+    hud.hrtf = stream->engine != 0;
+    hud.bed_virtualized = stream->virtualize_bed;
+    hud.dyn_live = stream->dyn_live;
+    hud.dyn_max = stream->dyn_max;
+
+    if(want_file){
+        for(i = 0; i < SPATIAL_BED_MAX; ++i){
+            spatial_stats.present[i] = (hud.bed_mask >> i) & 1;
+            spatial_stats.db[i] = hud.bed_db[i];
+        }
+        spatial_stats.hrtf = hud.hrtf;
+        spatial_stats.bed = hud.bed_virtualized;
+        spatial_stats.dyn_live = hud.dyn_live;
+        spatial_stats.dyn_max = hud.dyn_max;
+        InterlockedIncrement(&spatial_stats.seq);
+    }
+    if(want_hud){
+        hud.enabled = 0;
+        WINE_UNIX_CALL(unix_spatial_hud_publish, &hud);
+        if(!hud.enabled){
+            InterlockedExchange(&hud_off, 1);
+            InterlockedCompareExchangePointer((void **)&hud_stream, NULL, stream);
+        }
+    }
 }
 
 static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStream *iface)

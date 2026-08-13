@@ -74,6 +74,28 @@ struct spatial_mix_params
     UINT64 out_r;
 };
 
+/* Section B of the shared diagnostic snapshot.  Scalars only, all 4-byte, so
+ * the layout is identical for 32- and 64-bit callers without any explicit
+ * padding.  SPATIAL_BED_MAX and SPATIAL_DB_FLOOR are asserted against the
+ * snapshot's own PWHUD_BED_MAX and PWHUD_DB_FLOOR in unix/spatial.c, which is
+ * the one file that knows both, so this header stays independent of the
+ * driver's. */
+#define SPATIAL_BED_MAX  18
+#define SPATIAL_DB_FLOOR (-120.0f)
+
+struct spatial_hud_params
+{
+    UINT hrtf;
+    UINT bed_virtualized;
+    UINT bed_mask;            /* bit i set => bed channel i present */
+    UINT dyn_live;
+    UINT dyn_max;
+    UINT enabled;             /* out: 0 = no snapshot in this process, stop calling */
+    float bed_db[SPATIAL_BED_MAX];
+};
+
+C_ASSERT(sizeof(struct spatial_hud_params) == 96);
+
 enum spatial_unix_func
 {
     unix_spatial_init,
@@ -81,6 +103,7 @@ enum spatial_unix_func
     unix_spatial_object_add,
     unix_spatial_object_remove,
     unix_spatial_mix,
+    unix_spatial_hud_publish,
     spatial_funcs_count,
 };
 

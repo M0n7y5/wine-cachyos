@@ -25,11 +25,16 @@
 #include "config.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <limits.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <sys/mman.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -40,7 +45,15 @@
 
 #include "unixlib.h"
 
+/* Section B writes into the snapshot the pipewire driver's unixlib created.
+ * This is the only file that knows both ABIs; the spatial unixlib header
+ * stays independent of the driver's. */
+#include "../../winepipewire.drv/winepipewire_hud.h"
+
 WINE_DEFAULT_DEBUG_CHANNEL(spatial);
+
+C_ASSERT(SPATIAL_BED_MAX == PWHUD_BED_MAX);
+C_ASSERT(SPATIAL_DB_FLOOR == PWHUD_DB_FLOOR);
 
 /* Minimal Steam Audio 4.x C API declarations, from the documented interface
  * (github.com/ValveSoftware/steam-audio, Apache-2.0).  The library is
@@ -409,6 +422,96 @@ static NTSTATUS spatial_mix(void *args)
     return STATUS_SUCCESS;
 }
 
+/* Section B of the shared snapshot.  The pipewire driver's unixlib creates,
+ * sizes, pre-faults and header-stamps the file in its process attach; this
+ * module only ever opens an existing one.  So the file's existence is the
+ * gate: no WINEPIPEWIRE_HUD here and no environment read at all, which means
+ * a run under a different audio driver, or with the variable unset, cannot
+ * produce half a snapshot whose section A would be permanently zero.
+ *
+ * Tried exactly once.  The driver's process attach is the first unix call
+ * mmdevapi makes, and a spatial stream cannot exist before the device it was
+ * activated on was enumerated through that driver, so one attempt cannot race
+ * creation. */
+static struct pwhud_snapshot *hud_snap;
+static int hud_state;   /* 0 untried, 1 mapped, -1 unavailable */
+
+static void hud_map_once(void)
+{
+    struct pwhud_snapshot *snap;
+    const char *home = getenv("HOME");
+    char path[PATH_MAX];
+    int fd, n;
+
+    hud_state = -1;
+    if (!home || !home[0])
+        return;
+    n = snprintf(path, sizeof(path), "%s%s/%s%u", home, PWHUD_DIR_SUFFIX,
+                 PWHUD_FILE_PREFIX, (unsigned)getpid());
+    if (n < 0 || n >= (int)sizeof(path))
+        return;
+    if ((fd = open(path, O_RDWR | O_CLOEXEC)) < 0)
+    {
+        TRACE("no snapshot at %s, section B stays inert\n", path);
+        return;
+    }
+    snap = mmap(NULL, PWHUD_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (snap == MAP_FAILED)
+    {
+        WARN("cannot map %s: %s\n", path, strerror(errno));
+        return;
+    }
+    /* The creator stamps magic last, so a valid magic means the header is
+     * complete.  size guards against writing section B into a shorter file
+     * left by an older build. */
+    if (__atomic_load_n(&snap->magic, __ATOMIC_ACQUIRE) != PWHUD_MAGIC ||
+        snap->version > PWHUD_VERSION || snap->size < sizeof(*snap))
+    {
+        WARN("%s is not a usable snapshot (magic %#x version %u size %u)\n", path,
+             snap->magic, snap->version, snap->size);
+        munmap(snap, PWHUD_BYTES);
+        return;
+    }
+    if (mlock(snap, PWHUD_BYTES))
+        WARN("cannot lock the snapshot page (%s); a publish may fault\n", strerror(errno));
+
+    hud_snap = snap;
+    hud_state = 1;
+    TRACE("publishing section B into %s\n", path);
+}
+
+/* Seqlock B, one writer.  Plain stores into an already-faulted page plus two
+ * fences: the caller is the application's rendering thread. */
+static NTSTATUS spatial_hud_publish(void *args)
+{
+    struct spatial_hud_params *params = args;
+    struct pwhud_snapshot *snap;
+    UINT32 seq, i;
+
+    if (!hud_state)
+        hud_map_once();
+    params->enabled = hud_state > 0;
+    if (!(snap = hud_snap))
+        return STATUS_SUCCESS;
+
+    seq = __atomic_load_n(&snap->seq_sp, __ATOMIC_RELAXED);
+    __atomic_store_n(&snap->seq_sp, seq + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+
+    snap->sp_hrtf = params->hrtf;
+    snap->sp_bed_virtualized = params->bed_virtualized;
+    snap->sp_bed_mask = params->bed_mask;
+    snap->sp_dyn_live = params->dyn_live;
+    snap->sp_dyn_max = params->dyn_max;
+    for (i = 0; i < PWHUD_BED_MAX; i++)
+        snap->sp_bed_db[i] = params->bed_db[i];
+
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&snap->seq_sp, seq + 2, __ATOMIC_RELAXED);
+    return STATUS_SUCCESS;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     spatial_init,
@@ -416,6 +519,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     spatial_object_add,
     spatial_object_remove,
     spatial_mix,
+    spatial_hud_publish,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == spatial_funcs_count);
@@ -431,6 +535,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     spatial_object_add,
     spatial_object_remove,
     spatial_mix,
+    spatial_hud_publish,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == spatial_funcs_count);
