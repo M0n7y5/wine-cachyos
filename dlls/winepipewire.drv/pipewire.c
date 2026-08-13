@@ -60,8 +60,11 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <math.h>
+#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 
 #include <pipewire/pipewire.h>
 #include <pipewire/extensions/metadata.h>
@@ -86,6 +89,7 @@
 #include "../mmdevapi/unixlib.h"
 
 #include "mult.h"
+#include "winepipewire_hud.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(pipewire);
 
@@ -834,6 +838,112 @@ static void free_device_lists(void)
 }
 
 /* ----------------------------------------------------------------------
+ * Diagnostic snapshot (WINEPIPEWIRE_HUD)
+ * ---------------------------------------------------------------------- */
+
+/* NULL unless WINEPIPEWIRE_HUD=1.  Testing it is the whole per-tick cost of
+ * the feature when it is off. */
+static struct pwhud_snapshot *hud_snap;
+
+/* Effective render dispatch, latched by report_dispatch_mode; loop lock. */
+static UINT32 hud_dispatch = PWHUD_DISPATCH_UNKNOWN;
+
+/* The one period group publishing section A, so the seqlock keeps its single
+ * writer and the snapshot does not alternate between two device groups.
+ * Loop lock; every period timer takes the same one. */
+static struct pipewire_period *hud_period;
+
+/* $HOME/.cache itself may not exist yet in a fresh container. */
+static BOOL hud_mkdir(char *path)
+{
+    char *sep = strrchr(path, '/');
+
+    if (!mkdir(path, 0700) || errno == EEXIST)
+        return TRUE;
+    if (errno != ENOENT || !sep)
+        return FALSE;
+    *sep = 0;
+    if (mkdir(path, 0700) && errno != EEXIST)
+    {
+        *sep = '/';
+        return FALSE;
+    }
+    *sep = '/';
+    return !mkdir(path, 0700) || errno == EEXIST;
+}
+
+/* Map the per-pid snapshot page.  Everything expensive happens here, once:
+ * the publisher on the timer thread must not open, allocate or fault. */
+static void hud_init(void)
+{
+    char path[PATH_MAX];
+    const char *home = getenv("HOME");
+    struct pwhud_snapshot *snap;
+    size_t len = PWHUD_BYTES;
+    long page;
+    int fd, n;
+
+    if (!home || !home[0])
+    {
+        WARN("HOME is unset, so there is nowhere to publish the HUD snapshot.\n");
+        return;
+    }
+    n = snprintf(path, sizeof(path), "%s%s", home, PWHUD_DIR_SUFFIX);
+    if (n < 0 || n >= (int)sizeof(path))
+        return;
+    if (!hud_mkdir(path))
+    {
+        WARN("cannot create %s: %s\n", path, strerror(errno));
+        return;
+    }
+
+    n = snprintf(path, sizeof(path), "%s%s/%s%u", home, PWHUD_DIR_SUFFIX,
+                 PWHUD_FILE_PREFIX, (unsigned)getpid());
+    if (n < 0 || n >= (int)sizeof(path))
+        return;
+    if ((fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600)) < 0)
+    {
+        WARN("cannot open %s: %s\n", path, strerror(errno));
+        return;
+    }
+
+    /* The struct is pinned to 4096 bytes, but a host page may be larger and
+     * mmap rounds up, so the file must cover the whole mapping or stores past
+     * the last full page raise SIGBUS. */
+    if ((page = sysconf(_SC_PAGESIZE)) > 0 && (size_t)page > len)
+        len = (size_t)page;
+    if (ftruncate(fd, len))
+    {
+        WARN("cannot size %s: %s\n", path, strerror(errno));
+        close(fd);
+        return;
+    }
+    snap = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (snap == MAP_FAILED)
+    {
+        WARN("cannot map %s: %s\n", path, strerror(errno));
+        return;
+    }
+
+    /* A recycled pid can find a stale file, so clear it rather than trust
+     * ftruncate.  This also faults the page in before mlock. */
+    memset(snap, 0, len);
+    if (mlock(snap, len))
+        WARN("cannot lock the HUD page (%s); a publish may fault.\n", strerror(errno));
+
+    snap->version = PWHUD_VERSION;
+    snap->size = sizeof(*snap);
+    snap->writer_pid = (uint32_t)getpid();
+    /* Magic last: a reader must never find it over an uninitialised page. */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&snap->magic, PWHUD_MAGIC, __ATOMIC_RELAXED);
+
+    hud_snap = snap;
+    TRACE("publishing the HUD snapshot at %s\n", path);
+}
+
+/* ----------------------------------------------------------------------
  * Process attach / detach
  * ---------------------------------------------------------------------- */
 
@@ -923,6 +1033,7 @@ static void pipewire_set_plugin_dirs(void)
 static NTSTATUS pipewire_process_attach(void *args)
 {
     const char *rt = getenv("WINEPIPEWIRE_RT");
+    const char *hud = getenv("WINEPIPEWIRE_HUD");
     struct timespec ts;
     UINT64 rnd = 0;
 
@@ -947,6 +1058,9 @@ static NTSTATUS pipewire_process_attach(void *args)
      * crash report is read against is emitted there, not here. */
     TRACE("WINEPIPEWIRE_RT=%d requested, session=%016llx\n", rt_render,
           (unsigned long long)dispatch_token);
+
+    if (hud && !strcmp(hud, "1"))
+        hud_init();
     return STATUS_SUCCESS;
 }
 
@@ -2735,6 +2849,8 @@ static void report_dispatch_mode(struct pipewire_stream *stream, BOOL rt_render)
     UINT64 rt_soft;
     char rt_buf[32];
 
+    hud_dispatch = got_data ? PWHUD_DISPATCH_DATA : PWHUD_DISPATCH_LOOP;
+
     if (reported & bit)
         return;
     reported |= bit;
@@ -3307,6 +3423,8 @@ static NTSTATUS pipewire_release_stream(void *args)
         if (list_empty(&period->streams))
         {
             list_remove(&period->entry);
+            if (hud_period == period)
+                hud_period = NULL;
             __atomic_store_n(&period->please_quit, 1, __ATOMIC_RELEASE);
             dead_period = period;
         }
@@ -3440,6 +3558,167 @@ static void pipewire_read(struct pipewire_stream *stream)
     }
 }
 
+/* Peak magnitude per channel over one contiguous run of frames, accumulated
+ * into peak[].  Format coverage follows apply_volume: what that cannot scale
+ * in place is not metered here either. */
+static BOOL hud_peak_scan(const struct pipewire_stream *stream, const BYTE *buf,
+                          SIZE_T frames, UINT32 channels, float *peak)
+{
+    const UINT32 stride = stream->info.channels;
+    UINT32 c;
+    SIZE_T i;
+
+#define HUD_PEAK(type, bias, scale) do                  \
+{                                                       \
+    const type *p = (const type *)buf;                  \
+                                                        \
+    for (i = 0; i < frames; i++, p += stride)           \
+        for (c = 0; c < channels; c++)                  \
+        {                                               \
+            float v = ((float)p[c] - (bias)) * (scale); \
+                                                        \
+            if (v < 0.0f)                               \
+                v = -v;                                 \
+            if (v > peak[c])                            \
+                peak[c] = v;                            \
+        }                                               \
+} while (0)
+
+    switch (stream->info.format)
+    {
+#ifndef WORDS_BIGENDIAN
+    case SPA_AUDIO_FORMAT_S16_LE:
+        HUD_PEAK(INT16, 0.0f, 1.0f / 32768.0f);
+        break;
+    case SPA_AUDIO_FORMAT_S32_LE:
+        HUD_PEAK(INT32, 0.0f, 1.0f / 2147483648.0f);
+        break;
+    case SPA_AUDIO_FORMAT_F32_LE:
+        HUD_PEAK(float, 0.0f, 1.0f);
+        break;
+    case SPA_AUDIO_FORMAT_S24_LE:
+    {
+        const BYTE *p = buf;
+
+        for (i = 0; i < frames; i++, p += (SIZE_T)stride * 3)
+            for (c = 0; c < channels; c++)
+            {
+                const BYTE *q = p + c * 3;
+                /* Sign-extended by landing the 24 bits at the top of an
+                 * INT32, the same way apply_volume reads them. */
+                float v = (float)(INT32)((UINT32)q[0] << 8 | (UINT32)q[1] << 16 |
+                                         (UINT32)q[2] << 24) * (1.0f / 2147483648.0f);
+
+                if (v < 0.0f)
+                    v = -v;
+                if (v > peak[c])
+                    peak[c] = v;
+            }
+        break;
+    }
+#endif
+    case SPA_AUDIO_FORMAT_U8:
+        HUD_PEAK(UINT8, 128.0f, 1.0f / 128.0f);
+        break;
+    default:
+        return FALSE;
+    }
+#undef HUD_PEAK
+    return TRUE;
+}
+
+/* dBFS of the period of render audio the timer is about to retire.  The held
+ * region is stable under the loop lock: the process callback only copies out
+ * of it and the application writes past its end. */
+static UINT32 hud_render_peaks(const struct pipewire_stream *stream, float *peak)
+{
+    UINT32 channels = min(stream->info.channels, PWHUD_OUT_MAX), i;
+    SIZE_T bytes = min(stream->period_bytes, stream->held_bytes);
+    SIZE_T offs = stream->lcl_offs_bytes, head;
+
+    if (!channels || !bytes || !stream->frame_size || !stream->local_buffer)
+        return 0;
+    for (i = 0; i < channels; i++)
+        peak[i] = 0.0f;
+
+    head = min(bytes, stream->real_bufsize_bytes - offs);
+    if (!hud_peak_scan(stream, stream->local_buffer + offs, head / stream->frame_size,
+                       channels, peak))
+        return 0;
+    if (head < bytes)
+        hud_peak_scan(stream, stream->local_buffer, (bytes - head) / stream->frame_size,
+                      channels, peak);
+
+    for (i = 0; i < channels; i++)
+    {
+        float db = peak[i] > 0.0f ? 20.0f * log10f(peak[i]) : PWHUD_DB_FLOOR;
+
+        peak[i] = db < PWHUD_DB_FLOOR ? PWHUD_DB_FLOOR : db;
+    }
+    return channels;
+}
+
+/* Section A, from the elected period timer thread with the loop lock held.
+ * Relaxed atomic stores, plain stores into the locked page and two fences:
+ * no syscall, no allocation and no further lock, because this is the thread
+ * whose jitter the snapshot exists to measure. */
+static void hud_publish(const struct pipewire_period *period, const struct pw_time *pwt,
+                        BOOL have_time, INT64 adjust, UINT64 mono_ns)
+{
+    struct pwhud_snapshot *snap = hud_snap;
+    const struct pipewire_stream *timer_stream = period->timer_stream;
+    UINT32 seq = __atomic_load_n(&snap->seq_drv, __ATOMIC_RELAXED);
+    UINT32 under = 0, over = 0, bad = 0, count = 0, channels = 0, i;
+    float peak[PWHUD_OUT_MAX] = { 0.0f };
+    struct pipewire_stream *stream;
+
+    LIST_FOR_EACH_ENTRY(stream, &g_streams, struct pipewire_stream, entry)
+    {
+        under += __atomic_load_n(&stream->underrun_count, __ATOMIC_RELAXED);
+        over += __atomic_load_n(&stream->overrun_count, __ATOMIC_RELAXED);
+        bad += __atomic_load_n(&stream->bad_buffer_count, __ATOMIC_RELAXED);
+        count++;
+    }
+    if (timer_stream->dataflow == eRender)
+        channels = hud_render_peaks(timer_stream, peak);
+    if (!mono_ns)
+    {
+        struct timespec ts;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        mono_ns = (UINT64)ts.tv_sec * 1000000000 + ts.tv_nsec;
+    }
+
+    __atomic_store_n(&snap->seq_drv, seq + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+
+    snap->clock_ns = mono_ns;
+    snap->flags = (timer_stream->dataflow == eCapture ? PWHUD_F_CAPTURE : 0) |
+                  (period->grid_valid ? PWHUD_F_GRID_VALID : 0);
+    snap->pw_quantum = have_time ? (UINT32)pwt->size : 0;
+    snap->pw_rate = have_time && pwt->rate.num ? pwt->rate.denom / pwt->rate.num : 0;
+    /* Graph-wide xruns and DSP load live in the Profiler POD, which needs a
+     * second PipeWire connection.  Pinned to 0 until that exists. */
+    snap->pw_xruns = 0;
+    snap->pw_dsp_load = 0.0f;
+    snap->pw_stream_count = count;
+    snap->drv_dispatch = hud_dispatch;
+    snap->drv_underruns = under;
+    snap->drv_overruns = over;
+    snap->drv_bad_buffers = bad;
+    snap->drv_period_usec = (UINT32)min(period->period_usec, (UINT64)UINT32_MAX);
+    snap->drv_held_bytes = timer_stream->held_bytes;
+    snap->drv_ring_bytes = timer_stream->real_bufsize_bytes;
+    snap->drv_period_bytes = timer_stream->period_bytes;
+    snap->drv_phase_adjust_us = adjust;
+    for (i = 0; i < PWHUD_OUT_MAX; i++)
+        snap->out_peak_db[i] = i < channels ? peak[i] : PWHUD_DB_FLOOR;
+    snap->out_channels = channels;
+
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&snap->seq_drv, seq + 2, __ATOMIC_RELAXED);
+}
+
 static void pipewire_period_timer_loop(void *args)
 {
     struct pipewire_period *period = args;
@@ -3453,7 +3732,8 @@ static void pipewire_period_timer_loop(void *args)
     while (!__atomic_load_n(&period->please_quit, __ATOMIC_ACQUIRE))
     {
         INT64 adjust = 0;
-        int have_now = 0;
+        UINT64 mono_ns = 0;
+        int have_now = 0, have_time = 0;
 
         NtDelayExecution(FALSE, &delay);
 
@@ -3483,8 +3763,8 @@ static void pipewire_period_timer_loop(void *args)
             pwt.now && pwt.rate.denom)
         {
             struct timespec ts;
-            UINT64 mono_ns;
 
+            have_time = 1;
             clock_gettime(CLOCK_MONOTONIC, &ts);
             mono_ns = (UINT64)ts.tv_sec * 1000000000 + ts.tv_nsec;
 
@@ -3587,6 +3867,16 @@ static void pipewire_period_timer_loop(void *args)
             }
             if (stream->event)
                 NtSetEvent(stream->event, NULL);
+        }
+
+        /* One elected group publishes, so seqlock A keeps its single writer
+         * and the snapshot does not alternate between two device groups. */
+        if (hud_snap && period->timer_stream)
+        {
+            if (!hud_period || !hud_period->timer_stream)
+                hud_period = period;
+            if (hud_period == period)
+                hud_publish(period, &pwt, have_time, adjust, mono_ns);
         }
 
         pw_thread_loop_unlock(pw_loop_global);
