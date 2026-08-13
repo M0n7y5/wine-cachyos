@@ -3558,6 +3558,30 @@ static void pipewire_read(struct pipewire_stream *stream)
     }
 }
 
+/* Mirror of hud_peak_scan's switch, including its endianness guard.  Two
+ * switches rather than one because the scan needs a distinct body per format
+ * while this needs only an answer; a format added to one must be added to the
+ * other.  Kept adjacent so that is hard to miss, the same way
+ * spa_format_bytes, silence_buffer and apply_volume already each carry their
+ * own format switch.  Answering without touching audio is what lets
+ * PWHUD_F_OUT_NO_METER stay correct on a stream with nothing queued. */
+static BOOL hud_format_metered(enum spa_audio_format format)
+{
+    switch (format)
+    {
+#ifndef WORDS_BIGENDIAN
+    case SPA_AUDIO_FORMAT_S16_LE:
+    case SPA_AUDIO_FORMAT_S32_LE:
+    case SPA_AUDIO_FORMAT_F32_LE:
+    case SPA_AUDIO_FORMAT_S24_LE:
+#endif
+    case SPA_AUDIO_FORMAT_U8:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
 /* Peak magnitude per channel over one contiguous run of frames, accumulated
  * into peak[].  Format coverage follows apply_volume: what that cannot scale
  * in place is not metered here either. */
@@ -3630,11 +3654,20 @@ static BOOL hud_peak_scan(const struct pipewire_stream *stream, const BYTE *buf,
 /* dBFS of the period of render audio the timer is about to retire.  The held
  * region is stable under the loop lock: the process callback only copies out
  * of it and the application writes past its end. */
-static UINT32 hud_render_peaks(const struct pipewire_stream *stream, float *peak)
+static UINT32 hud_render_peaks(const struct pipewire_stream *stream, float *peak,
+                               UINT32 *flags)
 {
     UINT32 channels = min(stream->info.channels, PWHUD_OUT_MAX), i;
     SIZE_T bytes = min(stream->period_bytes, stream->held_bytes);
     SIZE_T offs = stream->lcl_offs_bytes, head;
+
+    /* Both describe the endpoint, not this tick, so they are set before any
+     * early return: an idle 7.1.4 endpoint still reports truncation and an
+     * idle A-law stream still reports that it has no meter. */
+    if (stream->info.channels > PWHUD_OUT_MAX)
+        *flags |= PWHUD_F_OUT_TRUNCATED;
+    if (!hud_format_metered(stream->info.format))
+        *flags |= PWHUD_F_OUT_NO_METER;
 
     if (!channels || !bytes || !stream->frame_size || !stream->local_buffer)
         return 0;
@@ -3668,7 +3701,7 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
     struct pwhud_snapshot *snap = hud_snap;
     const struct pipewire_stream *timer_stream = period->timer_stream;
     UINT32 seq = __atomic_load_n(&snap->seq_drv, __ATOMIC_RELAXED);
-    UINT32 under = 0, over = 0, bad = 0, count = 0, channels = 0, i;
+    UINT32 under = 0, over = 0, bad = 0, count = 0, channels = 0, out_flags = 0, i;
     float peak[PWHUD_OUT_MAX] = { 0.0f };
     struct pipewire_stream *stream;
 
@@ -3680,7 +3713,7 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
         count++;
     }
     if (timer_stream->dataflow == eRender)
-        channels = hud_render_peaks(timer_stream, peak);
+        channels = hud_render_peaks(timer_stream, peak, &out_flags);
     if (!mono_ns)
     {
         struct timespec ts;
@@ -3694,7 +3727,7 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
 
     snap->clock_ns = mono_ns;
     snap->flags = (timer_stream->dataflow == eCapture ? PWHUD_F_CAPTURE : 0) |
-                  (period->grid_valid ? PWHUD_F_GRID_VALID : 0);
+                  (period->grid_valid ? PWHUD_F_GRID_VALID : 0) | out_flags;
     snap->pw_quantum = have_time ? (UINT32)pwt->size : 0;
     snap->pw_rate = have_time && pwt->rate.num ? pwt->rate.denom / pwt->rate.num : 0;
     /* Graph-wide xruns and DSP load live in the Profiler POD, which needs a

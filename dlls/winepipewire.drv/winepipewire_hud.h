@@ -32,7 +32,37 @@
 #define PWHUD_MAGIC     0x54535750u  /* 'PWST' */
 #define PWHUD_VERSION   1u
 #define PWHUD_BYTES     4096u
-#define PWHUD_BED_MAX   16u
+/* 18, not 16, and not a round number somebody should tidy.
+ *
+ * AudioObjectType has 17 distinct static positions, FrontLeft 0x2 through
+ * BackCenter 0x20000 (include/spatialaudioclient.idl:27-43), which is why
+ * spatialaudio.c declares static_object_map[17].  16 was therefore below the
+ * real ceiling.  It was also provably reached: GTA V Enhanced ships a
+ * 16-channel static bed, 7.1 without LFE plus 4 Top plus 4 Bottom plus
+ * BackCenter (spatial-audio-test-games.md:11), so a title in the test set sat
+ * exactly on the old boundary with no margin.
+ *
+ * 18 rather than 17 for alignment: 17 floats is 68 bytes and takes sizeof to
+ * 236, which fails the sizeof % 8 assertion below and would need a trailing
+ * pad field to fix.  18 floats is 72 bytes and lands on 240 with no pad, and
+ * the spare slot sits above the real ceiling rather than inside it.
+ *
+ * Changed while section B was still unpublished, when it cost one constant
+ * and two assertions.  Once step 2 fills these fields in, the same change is
+ * an ABI migration. */
+#define PWHUD_BED_MAX   18u
+
+/* out_peak_db counts the driver's own output channels to the endpoint, from
+ * the negotiated PipeWire format, not spatial bed channels: those are
+ * sp_bed_db[PWHUD_BED_MAX], written by the other publisher.
+ *
+ * 8 is chosen, not assumed.  It covers stereo through 7.1, which is every
+ * endpoint that occurs here, and the scan is O(frames x channels) so raising
+ * it would double the worst-case tick cost for a configuration nobody has.
+ * A wider endpoint (7.1.4 over HDMI is the realistic case) is metered on its
+ * first 8 channels and says so with PWHUD_F_OUT_TRUNCATED, which is the part
+ * that matters: the limit is visible rather than silent.  Raising this is an
+ * ABI change; adding a flag bit is not. */
 #define PWHUD_OUT_MAX   8u
 
 /* $HOME is bind-mounted into the Steam pressure-vessel container at the same
@@ -42,8 +72,15 @@
 #define PWHUD_DIR_SUFFIX  "/.cache/winepipewire"
 #define PWHUD_FILE_PREFIX "hud."
 
-#define PWHUD_F_CAPTURE    0x1u  /* the published stream is eCapture */
-#define PWHUD_F_GRID_VALID 0x2u  /* period timer grid locked to the graph clock */
+#define PWHUD_F_CAPTURE        0x1u  /* the published stream is eCapture */
+#define PWHUD_F_GRID_VALID     0x2u  /* period timer grid locked to the graph clock */
+#define PWHUD_F_OUT_TRUNCATED  0x4u  /* endpoint has more than PWHUD_OUT_MAX channels;
+                                      * out_channels is the metered count, not the real one */
+#define PWHUD_F_BED_TRUNCATED  0x8u  /* section B: bed wider than PWHUD_BED_MAX.  Defined
+                                      * here so step 2 inherits the convention rather than
+                                      * inventing one; nothing sets it until then */
+#define PWHUD_F_OUT_NO_METER   0x10u /* the negotiated format carries no peak meter, so
+                                      * out_channels 0 means "no meter", not "silent" */
 
 #define PWHUD_DISPATCH_UNKNOWN 0u
 #define PWHUD_DISPATCH_DATA    1u
@@ -99,7 +136,7 @@ struct pwhud_snapshot
     float    sp_bed_db[PWHUD_BED_MAX];
 };
 
-C_ASSERT(sizeof(struct pwhud_snapshot) == 232);
+C_ASSERT(sizeof(struct pwhud_snapshot) == 240);
 C_ASSERT(sizeof(struct pwhud_snapshot) <= PWHUD_BYTES);
 C_ASSERT(sizeof(struct pwhud_snapshot) % 8 == 0);
 C_ASSERT(sizeof(float) == 4);
