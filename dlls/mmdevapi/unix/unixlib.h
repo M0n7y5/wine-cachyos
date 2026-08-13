@@ -90,11 +90,12 @@ struct spatial_hud_params
     UINT bed_mask;            /* bit i set => bed channel i present */
     UINT dyn_live;
     UINT dyn_max;
+    UINT bed_truncated;       /* a bed channel index exceeded SPATIAL_BED_MAX */
     UINT enabled;             /* out: 0 = no snapshot in this process, stop calling */
     float bed_db[SPATIAL_BED_MAX];
 };
 
-C_ASSERT(sizeof(struct spatial_hud_params) == 96);
+C_ASSERT(sizeof(struct spatial_hud_params) == 100);
 
 enum spatial_unix_func
 {

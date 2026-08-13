@@ -873,10 +873,17 @@ static void spatial_stats_update(SpatialAudioStreamImpl *stream)
 
     for(i = 0; i < SPATIAL_BED_MAX; ++i) hud.bed_db[i] = SPATIAL_DB_FLOOR;
     hud.bed_mask = 0;
+    hud.bed_truncated = 0;
     LIST_FOR_EACH_ENTRY(object, &stream->objects, SpatialAudioObjectImpl, entry){
-        if(object->invalidated || object->type == AudioObjectType_Dynamic ||
-                object->static_idx >= SPATIAL_BED_MAX)
+        if(object->invalidated || object->type == AudioObjectType_Dynamic)
             continue;
+        /* The bounds guard and the published bit are the same test, so they
+         * cannot drift: a bed wider than the wire array is reported, not
+         * silently dropped. */
+        if(object->static_idx >= SPATIAL_BED_MAX){
+            hud.bed_truncated = 1;
+            continue;
+        }
         hud.bed_db[object->static_idx] =
                 spatial_channel_dbfs(object->buf, stream->update_frames);
         hud.bed_mask |= 1u << object->static_idx;

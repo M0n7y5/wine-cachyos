@@ -506,6 +506,10 @@ static NTSTATUS spatial_hud_publish(void *args)
     snap->sp_dyn_max = params->dyn_max;
     for (i = 0; i < PWHUD_BED_MAX; i++)
         snap->sp_bed_db[i] = params->bed_db[i];
+    /* Inside seqlock B, so this bit is validated by seq_sp for a reader that
+     * takes it from the section B copy.  Section A's bits are untouched. */
+    pwhud_flags_publish(snap, PWHUD_F_MASK_B,
+                        params->bed_truncated ? PWHUD_F_BED_TRUNCATED : 0);
 
     __atomic_thread_fence(__ATOMIC_RELEASE);
     __atomic_store_n(&snap->seq_sp, seq + 2, __ATOMIC_RELAXED);
