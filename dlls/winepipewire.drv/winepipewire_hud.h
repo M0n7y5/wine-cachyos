@@ -115,6 +115,17 @@ C_ASSERT((PWHUD_F_MASK_A | PWHUD_F_MASK_B) == PWHUD_F_ALL);
  * reordered or repurposed; a reader accepts version <= its own and uses size
  * to learn which trailing fields exist.
  *
+ * Explicit padding is the one exception, and it is an exception because of
+ * what the rule is for: a reader must never misread a field it believes it
+ * understands.  Padding has never carried meaning, so no reader has ever read
+ * it and claiming it cannot produce a misread.  Two conditions make that
+ * true and both are checked rather than assumed: the whole page is zeroed at
+ * creation, so a writer too old to know the new field leaves it 0 and a newer
+ * reader sees the zero value rather than garbage, and the claimed slot must
+ * never have been written by anything.  Repurposing a field that once meant
+ * something stays forbidden, because there the old meaning is exactly what a
+ * reader would misread it as.
+ *
  * Each section has its own seqlock and exactly one writer.  Section A is
  * written by the driver's elected period-timer thread, section B by the PE
  * spatial publisher, so the two need no coordination. */
@@ -153,7 +164,17 @@ struct pwhud_snapshot
     int64_t  drv_phase_adjust_us;
     float    out_peak_db[PWHUD_OUT_MAX];
     uint32_t out_channels;
-    uint32_t _pad_a;
+    /* Successful render-ring resync repairs.  A repair snaps the process
+     * callback's read cursor forward onto the writer's, so whatever it had not
+     * yet played is dropped: an audible discontinuity bounded by the ring,
+     * which is 60 ms at 48 kHz stereo float32 with the usual six periods.  It
+     * is counted rather than flagged because it is rare, roughly one event
+     * against 9750 publishes in a measured 195 second session, so a bit that
+     * cleared per tick would be missed and its absence would read as "none".
+     * The failure path is not counted here; it already reports through
+     * ring_op_failed and returns an error to the application.  Claimed from
+     * padding, so every offset and the 240-byte size are unchanged. */
+    uint32_t drv_ring_resyncs;
 
     uint32_t seq_sp;             /* seqlock B */
     uint32_t sp_hrtf;
@@ -192,7 +213,7 @@ C_ASSERT(offsetof(struct pwhud_snapshot, drv_period_bytes)    ==  88);
 C_ASSERT(offsetof(struct pwhud_snapshot, drv_phase_adjust_us) ==  96);
 C_ASSERT(offsetof(struct pwhud_snapshot, out_peak_db)         == 104);
 C_ASSERT(offsetof(struct pwhud_snapshot, out_channels)        == 136);
-C_ASSERT(offsetof(struct pwhud_snapshot, _pad_a)              == 140);
+C_ASSERT(offsetof(struct pwhud_snapshot, drv_ring_resyncs)    == 140);
 C_ASSERT(offsetof(struct pwhud_snapshot, seq_sp)              == 144);
 C_ASSERT(offsetof(struct pwhud_snapshot, sp_hrtf)             == 148);
 C_ASSERT(offsetof(struct pwhud_snapshot, sp_bed_virtualized)  == 152);

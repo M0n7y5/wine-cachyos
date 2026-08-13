@@ -234,6 +234,11 @@ struct pipewire_stream
     INT64 clock_lastpos, clock_written;
     /* atomic: process callback relaxed-increments, timer/control relaxed-load */
     UINT32 underrun_count, overrun_count, bad_buffer_count;
+    /* Successful render-ring resync repairs.  Incremented on the unix-call
+     * thread under the loop lock, not in the process callback, so a plain
+     * store would do; kept atomic to match the counters above and because the
+     * timer thread loads it. */
+    UINT32 ring_resync_count;
     /* Graph driver xruns, seen through SPA_IO_Position.  io_position is stored
      * by io_changed on the loop thread and read by the process callback, which
      * is where the area is guaranteed live; the NULL io_changed clears it.  The
@@ -3762,7 +3767,7 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
     struct pwhud_snapshot *snap = hud_snap;
     const struct pipewire_stream *timer_stream = period->timer_stream;
     UINT32 seq = __atomic_load_n(&snap->seq_drv, __ATOMIC_RELAXED);
-    UINT32 under = 0, over = 0, bad = 0, count = 0, i;
+    UINT32 under = 0, over = 0, bad = 0, resyncs = 0, count = 0, i;
     struct pipewire_stream *stream;
 
     LIST_FOR_EACH_ENTRY(stream, &g_streams, struct pipewire_stream, entry)
@@ -3770,6 +3775,7 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
         under += __atomic_load_n(&stream->underrun_count, __ATOMIC_RELAXED);
         over += __atomic_load_n(&stream->overrun_count, __ATOMIC_RELAXED);
         bad += __atomic_load_n(&stream->bad_buffer_count, __ATOMIC_RELAXED);
+        resyncs += __atomic_load_n(&stream->ring_resync_count, __ATOMIC_RELAXED);
         count++;
     }
     if (!mono_ns)
@@ -3802,6 +3808,7 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
     snap->drv_underruns = under;
     snap->drv_overruns = over;
     snap->drv_bad_buffers = bad;
+    snap->drv_ring_resyncs = resyncs;
     snap->drv_period_usec = (UINT32)min(period->period_usec, (UINT64)UINT32_MAX);
     snap->drv_held_bytes = timer_stream->held_bytes;
     snap->drv_ring_bytes = timer_stream->real_bufsize_bytes;
@@ -4486,6 +4493,12 @@ static NTSTATUS pipewire_release_render_buffer(void *args)
             params->result = ring_op_hresult(res);
             return STATUS_SUCCESS;
         }
+        /* The repair succeeded, which is the case that used to pass in
+         * silence: it snaps the callback's read cursor forward onto ours, so
+         * whatever it had not yet played is dropped.  Audible, and invisible
+         * in overrun_count and bad_buffer_count because both describe capture
+         * faults.  The failing case is not counted here; it reported above. */
+        __atomic_add_fetch(&stream->ring_resync_count, 1, __ATOMIC_RELAXED);
     }
     else
         __atomic_add_fetch(&stream->pa_held_bytes, written_bytes, __ATOMIC_RELEASE);
