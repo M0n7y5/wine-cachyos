@@ -742,10 +742,17 @@ static float spatial_channel_dbfs(const float *buf, UINT32 frames)
 {
     double s = 0.0;
     UINT32 i;
-    if(!frames) return -120.0f;
+    if(!frames) return SPATIAL_DB_FLOOR;
     for(i = 0; i < frames; ++i) s += (double)buf[i] * buf[i];
     s = sqrt(s / frames);
-    return s <= 1e-6 ? -120.0f : (float)(20.0 * log10(s));
+    /* The buffer is the application's, so it holds whatever the title wrote,
+     * and a NaN fails every comparison: testing only for the quiet case with
+     * <= let a NaN through and published it as the channel's level.  Require
+     * a finite sum instead, so a NaN or an infinity degrades to the floor the
+     * way the driver's peak scan already degrades a NaN, rather than to a
+     * value no consumer can plot, compare or average. */
+    if(!isfinite(s) || s <= 1e-6) return SPATIAL_DB_FLOOR;
+    return (float)(20.0 * log10(s));
 }
 
 static BOOL spatial_stats_dos_path(WCHAR *out, DWORD cch)
