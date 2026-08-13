@@ -76,11 +76,27 @@
 #define PWHUD_F_GRID_VALID     0x2u  /* period timer grid locked to the graph clock */
 #define PWHUD_F_OUT_TRUNCATED  0x4u  /* endpoint has more than PWHUD_OUT_MAX channels;
                                       * out_channels is the metered count, not the real one */
-#define PWHUD_F_BED_TRUNCATED  0x8u  /* section B: bed wider than PWHUD_BED_MAX.  Defined
-                                      * here so step 2 inherits the convention rather than
-                                      * inventing one; nothing sets it until then */
+#define PWHUD_F_BED_TRUNCATED  0x8u  /* section B: bed wider than PWHUD_BED_MAX */
 #define PWHUD_F_OUT_NO_METER   0x10u /* the negotiated format carries no peak meter, so
                                       * out_channels 0 means "no meter", not "silent" */
+
+/* flags is one word with two publishers, so it is partitioned by owner and the
+ * partition is checked at compile time rather than remembered.  Adding a bit
+ * means adding it to PWHUD_F_ALL and to exactly one mask; miss the mask and the
+ * build fails here instead of the bit mysteriously never appearing.
+ *
+ * Section A used to assign this word outright, which silently erased every
+ * section B bit within one tick: A republishes at the period rate and B at
+ * 10 Hz, so a B bit survived at most one tick in ten.  Both sides now go
+ * through pwhud_flags_publish below and touch only their own mask. */
+#define PWHUD_F_ALL (PWHUD_F_CAPTURE | PWHUD_F_GRID_VALID | PWHUD_F_OUT_TRUNCATED | \
+                     PWHUD_F_BED_TRUNCATED | PWHUD_F_OUT_NO_METER)
+#define PWHUD_F_MASK_A (PWHUD_F_CAPTURE | PWHUD_F_GRID_VALID | PWHUD_F_OUT_TRUNCATED | \
+                        PWHUD_F_OUT_NO_METER)
+#define PWHUD_F_MASK_B (PWHUD_F_BED_TRUNCATED)
+
+C_ASSERT((PWHUD_F_MASK_A & PWHUD_F_MASK_B) == 0);
+C_ASSERT((PWHUD_F_MASK_A | PWHUD_F_MASK_B) == PWHUD_F_ALL);
 
 #define PWHUD_DISPATCH_UNKNOWN 0u
 #define PWHUD_DISPATCH_DATA    1u
@@ -172,5 +188,21 @@ C_ASSERT(offsetof(struct pwhud_snapshot, sp_bed_mask)         == 156);
 C_ASSERT(offsetof(struct pwhud_snapshot, sp_dyn_live)         == 160);
 C_ASSERT(offsetof(struct pwhud_snapshot, sp_dyn_max)          == 164);
 C_ASSERT(offsetof(struct pwhud_snapshot, sp_bed_db)           == 168);
+
+/* Replace this publisher's bits and leave the other side's untouched.  A
+ * compare-exchange loop, not fetch-and followed by fetch-or: that pair leaves a
+ * window in which this side's own bits all read clear, which is a state that
+ * never existed and which a reader can sample.  A 32-bit aligned atomic cannot
+ * tear, so a reader observes one coherent word without needing either seqlock,
+ * and the two publishers need no ordering relative to each other. */
+static inline void pwhud_flags_publish(struct pwhud_snapshot *snap, uint32_t mask,
+                                       uint32_t bits)
+{
+    uint32_t cur = __atomic_load_n(&snap->flags, __ATOMIC_RELAXED);
+
+    while (!__atomic_compare_exchange_n(&snap->flags, &cur, (cur & ~mask) | (bits & mask),
+                                        0, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+        ;
+}
 
 #endif /* __WINE_WINEPIPEWIRE_HUD_H */

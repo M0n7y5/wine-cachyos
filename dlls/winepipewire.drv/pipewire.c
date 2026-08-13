@@ -3726,8 +3726,11 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
     __atomic_thread_fence(__ATOMIC_RELEASE);
 
     snap->clock_ns = mono_ns;
-    snap->flags = (timer_stream->dataflow == eCapture ? PWHUD_F_CAPTURE : 0) |
-                  (period->grid_valid ? PWHUD_F_GRID_VALID : 0) | out_flags;
+    /* Section A owns PWHUD_F_MASK_A only; assigning the word outright erased
+     * section B's bits within a tick. */
+    pwhud_flags_publish(snap, PWHUD_F_MASK_A,
+                        (timer_stream->dataflow == eCapture ? PWHUD_F_CAPTURE : 0) |
+                        (period->grid_valid ? PWHUD_F_GRID_VALID : 0) | out_flags);
     snap->pw_quantum = have_time ? (UINT32)pwt->size : 0;
     snap->pw_rate = have_time && pwt->rate.num ? pwt->rate.denom / pwt->rate.num : 0;
     /* Graph-wide xruns and DSP load live in the Profiler POD, which needs a
