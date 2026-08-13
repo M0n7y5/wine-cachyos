@@ -3752,13 +3752,13 @@ static UINT32 hud_render_peaks(const struct pipewire_stream *stream, float *peak
  * no syscall, no allocation and no further lock, because this is the thread
  * whose jitter the snapshot exists to measure. */
 static void hud_publish(const struct pipewire_period *period, const struct pw_time *pwt,
-                        BOOL have_time, INT64 adjust, UINT64 mono_ns)
+                        BOOL have_time, INT64 adjust, UINT64 mono_ns,
+                        const float *peak, UINT32 channels, UINT32 out_flags)
 {
     struct pwhud_snapshot *snap = hud_snap;
     const struct pipewire_stream *timer_stream = period->timer_stream;
     UINT32 seq = __atomic_load_n(&snap->seq_drv, __ATOMIC_RELAXED);
-    UINT32 under = 0, over = 0, bad = 0, count = 0, channels = 0, out_flags = 0, i;
-    float peak[PWHUD_OUT_MAX] = { 0.0f };
+    UINT32 under = 0, over = 0, bad = 0, count = 0, i;
     struct pipewire_stream *stream;
 
     LIST_FOR_EACH_ENTRY(stream, &g_streams, struct pipewire_stream, entry)
@@ -3768,8 +3768,6 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
         bad += __atomic_load_n(&stream->bad_buffer_count, __ATOMIC_RELAXED);
         count++;
     }
-    if (timer_stream->dataflow == eRender)
-        channels = hud_render_peaks(timer_stream, peak, &out_flags);
     if (!mono_ns)
     {
         struct timespec ts;
@@ -3828,6 +3826,9 @@ static void pipewire_period_timer_loop(void *args)
         INT64 adjust = 0;
         UINT64 mono_ns = 0;
         int have_now = 0, have_time = 0;
+        float hud_peak[PWHUD_OUT_MAX] = { 0.0f };
+        UINT32 hud_channels = 0, hud_out_flags = 0;
+        BOOL hud_publishing = FALSE;
 
         NtDelayExecution(FALSE, &delay);
 
@@ -3917,6 +3918,24 @@ static void pipewire_period_timer_loop(void *args)
         }
         delay.QuadPart = -((INT64)period->period_usec + adjust) * 10;
 
+        /* The peak has to come off the ring before the drain below retires the
+         * period it describes.  After the drain lcl_offs_bytes has moved past
+         * those bytes and held_bytes is zero for any client that keeps a single
+         * period queued, which is every client that writes one period per
+         * event, mmdevapi's own spatial renderer among them: the scan then had
+         * nothing to look at and published no channels at all.  Electing the
+         * publisher here rather than at the publish keeps that choice
+         * unchanged while letting the scan run only for the group that will
+         * actually publish. */
+        if (hud_snap && period->timer_stream)
+        {
+            if (!hud_period || !hud_period->timer_stream)
+                hud_period = period;
+            hud_publishing = hud_period == period;
+        }
+        if (hud_publishing && period->timer_stream->dataflow == eRender)
+            hud_channels = hud_render_peaks(period->timer_stream, hud_peak, &hud_out_flags);
+
         LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
         {
             if (!stream->started)
@@ -3964,14 +3983,11 @@ static void pipewire_period_timer_loop(void *args)
         }
 
         /* One elected group publishes, so seqlock A keeps its single writer
-         * and the snapshot does not alternate between two device groups. */
-        if (hud_snap && period->timer_stream)
-        {
-            if (!hud_period || !hud_period->timer_stream)
-                hud_period = period;
-            if (hud_period == period)
-                hud_publish(period, &pwt, have_time, adjust, mono_ns);
-        }
+         * and the snapshot does not alternate between two device groups.  The
+         * election itself ran before the drain, with the peak scan. */
+        if (hud_publishing)
+            hud_publish(period, &pwt, have_time, adjust, mono_ns,
+                        hud_peak, hud_channels, hud_out_flags);
 
         pw_thread_loop_unlock(pw_loop_global);
     }
