@@ -1376,7 +1376,10 @@ static HRESULT activate_stream(SpatialAudioStreamImpl *stream)
         stream->stream_fmtex.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
         stream->dyn_left = 0;
         stream->dyn_right = 1;
-        TRACE("Virtualizing a %u-channel bed to stereo through HRTF.\n", bed_ch);
+        /* Which backend virtualizes it is not known here: the engine is created
+         * by the caller after this function returns, so naming HRTF at this
+         * point would claim a backend that may never load. */
+        TRACE("Bed virtualization requested: %u channels to stereo.\n", bed_ch);
     }else{
         stream->stream_fmtex.Format.nChannels = bed_ch;
         stream->stream_fmtex.dwChannelMask = bed_mask;
@@ -1418,9 +1421,15 @@ static HRESULT activate_stream(SpatialAudioStreamImpl *stream)
 
     stream->period_frames = MulDiv(period, stream->stream_fmtex.Format.nSamplesPerSec, 10000000);
 
+    /* Everything here is known now: the widths, the mask, the budget, and that
+     * virtualization was asked for.  Which backend serves it is not, because the
+     * engine is created in SAC_ActivateSpatialAudioStream after this function
+     * returns, so this line reports the request and leaves the backend to the two
+     * places that know it, the engine attempt in the caller and SAORS_Start. */
     TRACE_(spatial)("stream %p configured: %u-channel bed -> %u-channel endpoint, %s, static mask 0x%x, dynamic budget %u.\n",
             stream, bed_ch, stream->stream_fmtex.Format.nChannels,
-            stream->virtualize_bed ? "HRTF bed virtualization" : "multichannel passthrough",
+            stream->virtualize_bed ? "bed virtualization requested, backend chosen at activation"
+                                   : "multichannel passthrough",
             effective_mask, stream->dyn_max);
     return S_OK;
 }
@@ -1533,7 +1542,12 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
                 WINE_UNIX_CALL(unix_spatial_release, &release_params);
             }
             if(!obj->engine)
-                WARN_(spatial)("HRTF engine unavailable, dynamic objects will use stereo panning.\n");
+                /* Name what actually falls back.  With virtualize_bed set the bed
+                 * pans too, and naming only dynamic objects told a reader who
+                 * stopped here that the consequence was smaller than it is. */
+                WARN_(spatial)("HRTF engine unavailable, %s will use stereo panning.\n",
+                        obj->virtualize_bed ? "the bed and any dynamic objects"
+                                            : "dynamic objects");
         }
 
         *stream = &obj->ISpatialAudioObjectRenderStream_iface;
