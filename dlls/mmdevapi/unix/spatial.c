@@ -186,6 +186,18 @@ struct spatial_engine
     float lp_l, lp_r;   /* lowpass state, persists across mix calls */
 };
 
+/* Off for 0, n, f and off in either case, on for anything else.  The variable
+ * used to carry the LF gain, which made its two most obvious values mean the
+ * opposite of what they read as: 1 was unity gain, so the shelf was disabled,
+ * and 0 was zero gain, a total low-frequency kill measured at -16 dB on a
+ * 40 Hz tone against the default.  The gain lives in WINE_SPATIAL_BASS_GAIN
+ * now and this only enables or disables. */
+static int bass_env_on(const char *v)
+{
+    return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F' ||
+             ((v[0] == 'o' || v[0] == 'O') && (v[1] == 'f' || v[1] == 'F')));
+}
+
 static NTSTATUS spatial_init(void *args)
 {
     struct spatial_init_params *params = args;
@@ -237,11 +249,11 @@ static NTSTATUS spatial_init(void *args)
 
     {
         const char *bass = getenv("WINE_SPATIAL_BASS");
+        const char *gain = getenv("WINE_SPATIAL_BASS_GAIN");
         const char *hz = getenv("WINE_SPATIAL_BASS_HZ");
-        /* defaults calibrated to the measured correlated-bed bass buildup: a
-         * flat ~+5 dB plateau below ~140 Hz that rolls off to 0 by ~1 kHz */
+        int on = !bass || !bass[0] || bass_env_on(bass);
         float fc = hz && hz[0] ? (float)atof(hz) : 500.0f;
-        float g = bass && bass[0] ? (float)atof(bass) : 0.48f; /* default-on; WINE_SPATIAL_BASS=1 disables */
+        float g = gain && gain[0] ? (float)atof(gain) : 0.48f;
 
         /* the one-pole state persists across mix calls, so a NaN or a negative
          * coefficient would poison every later sample; NaN fails every ordered
@@ -252,9 +264,10 @@ static NTSTATUS spatial_init(void *args)
         engine->bass_g = g;
         engine->bass_a = 2.0f * 3.14159265358979f * fc / (float)params->rate;
         if (engine->bass_a > 1.0f) engine->bass_a = 1.0f;
-        engine->bass_on = (g < 1.0f);
-        if (engine->bass_on)
-            TRACE("bass low-shelf on: LF gain %.2f, corner %.0f Hz.\n", g, fc);
+        /* a unity gain is the same shelf as none, so it still skips the pass */
+        engine->bass_on = on && g < 1.0f;
+        TRACE("bass low-shelf %s: LF gain %.2f, corner %.0f Hz.\n",
+              engine->bass_on ? "on" : "off", g, fc);
     }
 
     TRACE("engine %p: %u Hz, %u frames.\n", engine, params->rate, params->frames);
