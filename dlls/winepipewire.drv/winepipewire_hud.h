@@ -79,6 +79,9 @@
 #define PWHUD_F_BED_TRUNCATED  0x8u  /* section B: bed wider than PWHUD_BED_MAX */
 #define PWHUD_F_OUT_NO_METER   0x10u /* the negotiated format carries no peak meter, so
                                       * out_channels 0 means "no meter", not "silent" */
+#define PWHUD_F_NO_DSP_LOAD    0x20u /* pw_dsp_load is not implemented, so 0.0 means "not
+                                      * measured" and must be rendered as unavailable.
+                                      * Scoped to that one field so it can be cleared alone */
 
 /* flags is one word with two publishers, so it is partitioned by owner and the
  * partition is checked at compile time rather than remembered.  Adding a bit
@@ -90,9 +93,9 @@
  * 10 Hz, so a B bit survived at most one tick in ten.  Both sides now go
  * through pwhud_flags_publish below and touch only their own mask. */
 #define PWHUD_F_ALL (PWHUD_F_CAPTURE | PWHUD_F_GRID_VALID | PWHUD_F_OUT_TRUNCATED | \
-                     PWHUD_F_BED_TRUNCATED | PWHUD_F_OUT_NO_METER)
+                     PWHUD_F_BED_TRUNCATED | PWHUD_F_OUT_NO_METER | PWHUD_F_NO_DSP_LOAD)
 #define PWHUD_F_MASK_A (PWHUD_F_CAPTURE | PWHUD_F_GRID_VALID | PWHUD_F_OUT_TRUNCATED | \
-                        PWHUD_F_OUT_NO_METER)
+                        PWHUD_F_OUT_NO_METER | PWHUD_F_NO_DSP_LOAD)
 #define PWHUD_F_MASK_B (PWHUD_F_BED_TRUNCATED)
 
 C_ASSERT((PWHUD_F_MASK_A & PWHUD_F_MASK_B) == 0);
@@ -127,9 +130,18 @@ struct pwhud_snapshot
 
     uint32_t pw_quantum;         /* frames */
     uint32_t pw_rate;            /* Hz */
+    /* The GRAPH DRIVER node's xruns, not this stream's: it is the device the
+     * graph is clocked by, shared with every other client on it, so a nonzero
+     * value means the sink glitched and not that we starved.  Our own ring
+     * starving is drv_underruns, a different failure with a different fix.
+     *
+     * A count of observed episodes.  The underlying signal is spa_io_clock.xrun,
+     * an accumulated duration in samples at the clock rate, so a future field
+     * could carry milliseconds without rediscovering that; one episode here is
+     * one increase of that accumulator, however many quanta it spans. */
     uint32_t pw_xruns;
     uint32_t pw_stream_count;
-    float    pw_dsp_load;        /* 0..1 */
+    float    pw_dsp_load;        /* 0..1, meaningless unless PWHUD_F_NO_DSP_LOAD is clear */
     uint32_t drv_dispatch;
     uint32_t drv_underruns;
     uint32_t drv_overruns;

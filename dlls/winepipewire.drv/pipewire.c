@@ -68,6 +68,7 @@
 
 #include <pipewire/pipewire.h>
 #include <pipewire/extensions/metadata.h>
+#include <spa/node/io.h>
 #include <spa/param/param.h>
 #include <spa/param/props.h>
 #include <spa/param/audio/format-utils.h>
@@ -233,6 +234,16 @@ struct pipewire_stream
     INT64 clock_lastpos, clock_written;
     /* atomic: process callback relaxed-increments, timer/control relaxed-load */
     UINT32 underrun_count, overrun_count, bad_buffer_count;
+    /* Graph driver xruns, seen through SPA_IO_Position.  io_position is stored
+     * by io_changed on the loop thread and read by the process callback, which
+     * is where the area is guaranteed live; the NULL io_changed clears it.  The
+     * xrun_ fields are callback-private, pw_xrun_count is atomic like the
+     * counters above. */
+    struct spa_io_position *io_position;
+    UINT64 xrun_bytes;
+    UINT32 xrun_clock_id;
+    BOOL xrun_based;
+    UINT32 pw_xrun_count;
     UINT32 ring_warned;   /* RING_OP_* bits already reported for this stream */
     UINT32 cb_seq;        /* callback-private: callbacks entered */
     UINT32 cb_mark;       /* diagnostic breadcrumb, never read by the driver */
@@ -2576,6 +2587,49 @@ static void on_stream_state_changed(void *data, enum pw_stream_state old,
         pw_thread_loop_signal(pw_loop_global, false);
 }
 
+/* PW loop thread, lock held: one atomic store, no Wine calls.  A NULL area is
+ * the teardown signal, so lifetime is told to us rather than inferred. */
+static void on_stream_io_changed(void *data, uint32_t id, void *area, uint32_t size)
+{
+    struct pipewire_stream *stream = data;
+
+    if (id != SPA_IO_Position)
+        return;
+    if (area && size < sizeof(struct spa_io_position))
+        area = NULL;
+    __atomic_store_n(&stream->io_position, area, __ATOMIC_RELEASE);
+}
+
+/* Count episodes of the graph driver's accumulated xrun duration.
+ *
+ * The reset case is a correctness requirement, not an edge case: the
+ * accumulator belongs to the current driver node, so a device switch or a graph
+ * restart hands us a different node whose accumulator is unrelated and usually
+ * smaller.  Rebasing without counting is what keeps the published count
+ * monotonic instead of jumping on every switch.
+ *
+ * spa_io_clock.cycle is NOT the reset signal despite its header comment: it
+ * advances every cycle, measured at 48 per callback here, so keying on it would
+ * suppress every count.  The driver identity is clock.id, and a decrease of the
+ * accumulator catches a same-id restart. */
+static void stream_count_graph_xruns(struct pipewire_stream *stream)
+{
+    const struct spa_io_position *pos =
+            __atomic_load_n(&stream->io_position, __ATOMIC_ACQUIRE);
+    UINT64 x;
+    UINT32 id;
+
+    if (!pos)
+        return;
+    x = pos->clock.xrun;
+    id = pos->clock.id;
+    if (stream->xrun_based && id == stream->xrun_clock_id && x > stream->xrun_bytes)
+        __atomic_add_fetch(&stream->pw_xrun_count, 1, __ATOMIC_RELAXED);
+    stream->xrun_bytes = x;
+    stream->xrun_clock_id = id;
+    stream->xrun_based = TRUE;
+}
+
 static void on_stream_process(void *data)
 {
     struct pipewire_stream *stream = data;
@@ -2585,6 +2639,7 @@ static void on_stream_process(void *data)
 
     stream->cb_seq++;
     CB_MARK(stream, CB_ENTER);
+    stream_count_graph_xruns(stream);
 
     if (!(b = pw_stream_dequeue_buffer(stream->pw)))
         return;
@@ -2725,6 +2780,7 @@ static void on_stream_process(void *data)
 static const struct pw_stream_events stream_events = {
     PW_VERSION_STREAM_EVENTS,
     .state_changed = on_stream_state_changed,
+    .io_changed = on_stream_io_changed,
     .process = on_stream_process,
 };
 
@@ -3730,12 +3786,14 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
      * section B's bits within a tick. */
     pwhud_flags_publish(snap, PWHUD_F_MASK_A,
                         (timer_stream->dataflow == eCapture ? PWHUD_F_CAPTURE : 0) |
-                        (period->grid_valid ? PWHUD_F_GRID_VALID : 0) | out_flags);
+                        (period->grid_valid ? PWHUD_F_GRID_VALID : 0) |
+                        PWHUD_F_NO_DSP_LOAD | out_flags);
     snap->pw_quantum = have_time ? (UINT32)pwt->size : 0;
     snap->pw_rate = have_time && pwt->rate.num ? pwt->rate.denom / pwt->rate.num : 0;
-    /* Graph-wide xruns and DSP load live in the Profiler POD, which needs a
-     * second PipeWire connection.  Pinned to 0 until that exists. */
-    snap->pw_xruns = 0;
+    snap->pw_xruns = __atomic_load_n(&timer_stream->pw_xrun_count, __ATOMIC_RELAXED);
+    /* DSP load lives in the Profiler POD, which an ordinary client cannot bind
+     * without loading a PipeWire module of its own; see overlay-design.md 3.5.
+     * The flag is what stops a reader drawing 0.0 as a measurement. */
     snap->pw_dsp_load = 0.0f;
     snap->pw_stream_count = count;
     snap->drv_dispatch = hud_dispatch;
