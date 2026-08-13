@@ -3770,6 +3770,15 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
     UINT32 under = 0, over = 0, bad = 0, resyncs = 0, count = 0, i;
     struct pipewire_stream *stream;
 
+    /* Deliberately over live streams only, so these answer "how is the audio
+     * doing right now", which is the question an overlay exists to answer.  A
+     * total carrying a long-dead stream's startup underruns would be noise.
+     *
+     * The consequence, and it is chosen rather than overlooked: the published
+     * totals are NOT monotonic.  Releasing a stream removes its contribution
+     * and every one of these can fall.  A consumer must not read a decrease as
+     * a fault; an overlay once did, and reported a phantom glitch every time a
+     * title swapped streams.  Do not "fix" this into a monotonic accumulator. */
     LIST_FOR_EACH_ENTRY(stream, &g_streams, struct pipewire_stream, entry)
     {
         under += __atomic_load_n(&stream->underrun_count, __ATOMIC_RELAXED);
