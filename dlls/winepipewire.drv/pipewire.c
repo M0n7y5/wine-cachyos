@@ -3742,7 +3742,11 @@ static UINT32 hud_render_peaks(const struct pipewire_stream *stream, float *peak
     {
         float db = peak[i] > 0.0f ? 20.0f * log10f(peak[i]) : PWHUD_DB_FLOOR;
 
-        peak[i] = db < PWHUD_DB_FLOOR ? PWHUD_DB_FLOOR : db;
+        /* A NaN sample never reaches peak[] because it loses the > test in the
+         * scan, but an infinity wins it, and log10f then carries the infinity
+         * into the published level.  Both ends are pinned here so out_peak_db
+         * is a number whatever the application wrote into the ring. */
+        peak[i] = isfinite(db) && db > PWHUD_DB_FLOOR ? db : PWHUD_DB_FLOOR;
     }
     return channels;
 }
