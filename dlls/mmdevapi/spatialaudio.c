@@ -218,6 +218,18 @@ struct SpatialAudioImpl {
  * remaining limitation is visible rather than silent.  Section A elects its
  * period group the same way, for the same reason. */
 static SpatialAudioStreamImpl *hud_stream;
+/* One-way and process-wide on purpose, because both ways of setting it are
+ * permanent for the process and neither can turn transient:
+ *   - the snapshot file is created only by the driver's hud_init, whose one
+ *     call site is pipewire_process_attach (pipewire.c:1079), so it exists
+ *     from before the first stream or it never exists;
+ *   - the unix side maps at most once, hud_map_once behind if (!hud_state)
+ *     (spatial.c:518-519), and nothing resets hud_state, so a failed map is
+ *     never retried even if the file did appear.
+ * Clearing this on stream release would therefore re-learn the same answer at
+ * 10 Hz forever, one unixlib transition per tick, and would also restart the
+ * per-tick dBFS pass that want_hud gates.  If either half above ever stops
+ * holding, this must become a bounded retry rather than a latch. */
 static LONG hud_off;            /* the unix side found no snapshot; stop calling */
 static LONG hud_multi_warned;
 
@@ -912,10 +924,21 @@ static void spatial_stats_update(SpatialAudioStreamImpl *stream)
         InterlockedIncrement(&spatial_stats.seq);
     }
     if(want_hud){
+        /* Activation has already initialised the unixlib for every stream
+         * that reaches here, so this is a cached flag read.  It stays to hold
+         * "never dispatch without a handle" at the call site: a stream that
+         * dispatches on a zero handle faults inside the unix-call frame, and
+         * the ignored STATUS_ACCESS_VIOLATION latches hud_off process-wide. */
+        BOOL unix_up = spatial_unix_init();
+
         hud.enabled = 0;
-        WINE_UNIX_CALL(unix_spatial_hud_publish, &hud);
+        if(unix_up)
+            WINE_UNIX_CALL(unix_spatial_hud_publish, &hud);
         if(!hud.enabled){
-            InterlockedExchange(&hud_off, 1);
+            if(!InterlockedExchange(&hud_off, 1))
+                WARN_(spatial)("Section B is inert for this process: %s.\n", unix_up ?
+                        "the driver published no snapshot to write into" :
+                        "the mmdevapi unixlib did not initialise");
             InterlockedCompareExchangePointer((void **)&hud_stream, NULL, stream);
         }
     }
@@ -992,6 +1015,7 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
                 }
             }
         }
+
         spatial_stats_update(This);
 
         /* an object that misses an update cycle is invalidated */
@@ -1526,28 +1550,41 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
             return hr;
         }
 
-        if((obj->dyn_max || obj->virtualize_bed) && spatial_unix_init()){
-            struct spatial_init_params init_params;
-            init_params.rate = obj->stream_fmtex.Format.nSamplesPerSec;
-            init_params.frames = obj->period_frames;
-            init_params.handle = 0;
-            if(!WINE_UNIX_CALL(unix_spatial_init, &init_params) &&
-                    (obj->hrtf_buf = calloc(2 * obj->period_frames, sizeof(float)))){
-                obj->engine = init_params.handle;
-                TRACE_(spatial)("Using the Steam Audio HRTF engine (bed virtualization %s, up to %u dynamic objects).\n", obj->virtualize_bed ? "on" : "off", obj->dyn_max);
+        /* Initialise the unixlib for every spatial stream, not only one that
+         * wants an engine, because the section B publish on the mix path needs
+         * the handle too.  Doing it here keeps the one-time
+         * __wine_init_unix_call off the application's audio thread, and it
+         * widens nothing: mmdevapi.so loads once per process, and any process
+         * that ever publishes would have loaded it on its first publish. It
+         * does not pull in libphonon, which spatial_init dlopens behind its
+         * own pthread_once (spatial.c:208). */
+        if(spatial_unix_init()){
+            if(obj->dyn_max || obj->virtualize_bed){
+                struct spatial_init_params init_params;
+                init_params.rate = obj->stream_fmtex.Format.nSamplesPerSec;
+                init_params.frames = obj->period_frames;
+                init_params.handle = 0;
+                if(!WINE_UNIX_CALL(unix_spatial_init, &init_params) &&
+                        (obj->hrtf_buf = calloc(2 * obj->period_frames, sizeof(float)))){
+                    obj->engine = init_params.handle;
+                    TRACE_(spatial)("Using the Steam Audio HRTF engine "
+                            "(bed virtualization %s, up to %u dynamic objects).\n",
+                            obj->virtualize_bed ? "on" : "off", obj->dyn_max);
+                }
+                else if(init_params.handle){
+                    struct spatial_release_params release_params;
+                    release_params.handle = init_params.handle;
+                    WINE_UNIX_CALL(unix_spatial_release, &release_params);
+                }
+                if(!obj->engine)
+                    /* Name what actually falls back.  With virtualize_bed set
+                     * the bed pans too, and naming only dynamic objects told a
+                     * reader who stopped here that the consequence was smaller
+                     * than it is. */
+                    WARN_(spatial)("HRTF engine unavailable, %s will use stereo panning.\n",
+                            obj->virtualize_bed ? "the bed and any dynamic objects"
+                                                : "dynamic objects");
             }
-            else if(init_params.handle){
-                struct spatial_release_params release_params;
-                release_params.handle = init_params.handle;
-                WINE_UNIX_CALL(unix_spatial_release, &release_params);
-            }
-            if(!obj->engine)
-                /* Name what actually falls back.  With virtualize_bed set the bed
-                 * pans too, and naming only dynamic objects told a reader who
-                 * stopped here that the consequence was smaller than it is. */
-                WARN_(spatial)("HRTF engine unavailable, %s will use stereo panning.\n",
-                        obj->virtualize_bed ? "the bed and any dynamic objects"
-                                            : "dynamic objects");
         }
 
         *stream = &obj->ISpatialAudioObjectRenderStream_iface;
