@@ -911,6 +911,7 @@ static void spatial_stats_update(SpatialAudioStreamImpl *stream)
     hud.bed_virtualized = stream->virtualize_bed;
     hud.dyn_live = stream->dyn_live;
     hud.dyn_max = stream->dyn_max;
+    hud.announce = 0;
 
     if(want_file){
         for(i = 0; i < SPATIAL_BED_MAX; ++i){
@@ -1559,6 +1560,21 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
          * does not pull in libphonon, which spatial_init dlopens behind its
          * own pthread_once (spatial.c:208). */
         if(spatial_unix_init()){
+            /* Announce that a spatial stream exists before it renders
+             * anything, so a reader can tell "no spatial client in this
+             * process" from "one exists and is not publishing"; both read as
+             * seq_sp == 0, and the benign one got chased as a fault.  Off the
+             * mix path, once per stream, and skipped once hud_off has latched
+             * because nothing is listening then.  It sits outside the engine
+             * test below because a stream is visible whether or not it ever
+             * asks for an engine. */
+            if(!hud_off){
+                struct spatial_hud_params ann;
+                memset(&ann, 0, sizeof(ann));
+                ann.announce = 1;
+                WINE_UNIX_CALL(unix_spatial_hud_publish, &ann);
+            }
+
             if(obj->dyn_max || obj->virtualize_bed){
                 struct spatial_init_params init_params;
                 init_params.rate = obj->stream_fmtex.Format.nSamplesPerSec;

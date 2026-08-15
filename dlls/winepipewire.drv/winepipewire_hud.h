@@ -205,9 +205,28 @@ struct pwhud_snapshot
      * written inside seqlock A. */
     uint32_t drv_stream_id;
     uint32_t drv_group_streams;
+
+    /* Section B, same problem at the other end.  seq_sp == 0 meant three
+     * different things and rendered as one string, "never published", which
+     * reads as a fault when the usual cause is a title that has simply never
+     * activated spatial audio.
+     *
+     * sp_clients counts ISpatialAudioObjectRenderStream activations in this
+     * process.  It is NOT covered by seqlock B and must not be: the seqlock
+     * has exactly one writer, the stream that won the publish election, while
+     * every activating stream stamps this one.  It is incremented atomically
+     * instead, the same treatment the flags word gets, so an activation on one
+     * thread cannot corrupt a mix publish on another.  sp_publishes counts mix
+     * publishes and IS inside the seqlock with the bed values it describes.
+     *
+     * So a reader has three states: clients 0 means no spatial client has ever
+     * existed, clients nonzero with publishes 0 means one exists and has never
+     * mixed, and publishes nonzero means the bed values above are live. */
+    uint32_t sp_clients;
+    uint32_t sp_publishes;
 };
 
-C_ASSERT(sizeof(struct pwhud_snapshot) == 248);
+C_ASSERT(sizeof(struct pwhud_snapshot) == 256);
 C_ASSERT(sizeof(struct pwhud_snapshot) <= PWHUD_BYTES);
 C_ASSERT(sizeof(struct pwhud_snapshot) % 8 == 0);
 C_ASSERT(sizeof(float) == 4);
@@ -245,6 +264,8 @@ C_ASSERT(offsetof(struct pwhud_snapshot, sp_dyn_max)          == 164);
 C_ASSERT(offsetof(struct pwhud_snapshot, sp_bed_db)           == 168);
 C_ASSERT(offsetof(struct pwhud_snapshot, drv_stream_id)       == 240);
 C_ASSERT(offsetof(struct pwhud_snapshot, drv_group_streams)   == 244);
+C_ASSERT(offsetof(struct pwhud_snapshot, sp_clients)          == 248);
+C_ASSERT(offsetof(struct pwhud_snapshot, sp_publishes)        == 252);
 /* The baseline is exactly the end of sp_bed_db.  Pinned, because a reader
  * validating against it would otherwise be trusting a number that could drift
  * away from the last field an old writer actually wrote. */

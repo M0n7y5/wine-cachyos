@@ -91,11 +91,15 @@ struct spatial_hud_params
     UINT dyn_live;
     UINT dyn_max;
     UINT bed_truncated;       /* a bed channel index exceeded SPATIAL_BED_MAX */
+    /* An announce publish stamps "a spatial stream exists in this process"
+     * and nothing else: no bed values, no flags, and no seqlock.  It runs
+     * once per stream at activation, off the mix path. */
+    UINT announce;
     UINT enabled;             /* out: 0 = no snapshot in this process, stop calling */
     float bed_db[SPATIAL_BED_MAX];
 };
 
-C_ASSERT(sizeof(struct spatial_hud_params) == 100);
+C_ASSERT(sizeof(struct spatial_hud_params) == 104);
 
 enum spatial_unix_func
 {

@@ -508,7 +508,18 @@ static void hud_map_once(void)
 }
 
 /* Seqlock B, one writer.  Plain stores into an already-faulted page plus two
- * fences: the caller is the application's rendering thread. */
+ * fences: the caller is the application's rendering thread.
+ *
+ * The single writer is the stream that won spatial_hud_claim, and that
+ * election covers the mix publish only.  An announce is issued by every
+ * activating stream and is NOT elected, so it must never enter the seqlock:
+ * a stream activating while the elected stream is mid-publish would be a
+ * second writer, and two read-modify-writes on seq_sp lose an update and can
+ * leave the sequence even while a write is in flight, which a reader would
+ * accept as consistent.  sp_clients is therefore a standalone atomic counter
+ * outside the protected region, the same treatment the flags word already
+ * gets and for the same reason: it is one aligned 32-bit word that cannot
+ * tear and it is not part of any multi-field snapshot. */
 static NTSTATUS spatial_hud_publish(void *args)
 {
     struct spatial_hud_params *params = args;
@@ -521,21 +532,31 @@ static NTSTATUS spatial_hud_publish(void *args)
     if (!(snap = hud_snap))
         return STATUS_SUCCESS;
 
+    if (params->announce)
+    {
+        __atomic_fetch_add(&snap->sp_clients, 1, __ATOMIC_RELEASE);
+        return STATUS_SUCCESS;
+    }
+
     seq = __atomic_load_n(&snap->seq_sp, __ATOMIC_RELAXED);
     __atomic_store_n(&snap->seq_sp, seq + 1, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_RELEASE);
 
-    snap->sp_hrtf = params->hrtf;
-    snap->sp_bed_virtualized = params->bed_virtualized;
-    snap->sp_bed_mask = params->bed_mask;
-    snap->sp_dyn_live = params->dyn_live;
-    snap->sp_dyn_max = params->dyn_max;
-    for (i = 0; i < PWHUD_BED_MAX; i++)
-        snap->sp_bed_db[i] = params->bed_db[i];
-    /* Inside seqlock B, so this bit is validated by seq_sp for a reader that
-     * takes it from the section B copy.  Section A's bits are untouched. */
-    pwhud_flags_publish(snap, PWHUD_F_MASK_B,
-                        params->bed_truncated ? PWHUD_F_BED_TRUNCATED : 0);
+    {
+        snap->sp_hrtf = params->hrtf;
+        snap->sp_bed_virtualized = params->bed_virtualized;
+        snap->sp_bed_mask = params->bed_mask;
+        snap->sp_dyn_live = params->dyn_live;
+        snap->sp_dyn_max = params->dyn_max;
+        for (i = 0; i < PWHUD_BED_MAX; i++)
+            snap->sp_bed_db[i] = params->bed_db[i];
+        snap->sp_publishes++;
+        /* Inside seqlock B, so this bit is validated by seq_sp for a reader
+         * that takes it from the section B copy.  Section A's bits are
+         * untouched. */
+        pwhud_flags_publish(snap, PWHUD_F_MASK_B,
+                            params->bed_truncated ? PWHUD_F_BED_TRUNCATED : 0);
+    }
 
     __atomic_thread_fence(__ATOMIC_RELEASE);
     __atomic_store_n(&snap->seq_sp, seq + 2, __ATOMIC_RELAXED);
