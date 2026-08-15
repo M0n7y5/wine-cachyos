@@ -945,6 +945,23 @@ static void spatial_stats_update(SpatialAudioStreamImpl *stream)
     }
 }
 
+/* The binaural stage returns more power than it was handed, by a constant that
+ * belongs to the engine and not to the content.  Measured two ways that agree:
+ * +2.89 dB as a power-weighted mean over the eleven fixed bed directions, and
+ * +2.79 dB over 48 directions on a uniform sphere, the latter reachable only
+ * through dynamic objects because the bed cannot be steered.  Anything in
+ * [-2.89, -2.79] is indistinguishable against the 0.28 dB run-to-run spread of
+ * the rig that measured it, so the midpoint ships.
+ *
+ * The constant is not sensitive to that scope; it is sensitive to where the
+ * content sits.  The horizontal band alone measures +3.47 dB and the upper
+ * hemisphere +2.32, so a title holding its objects near ear level is
+ * under-padded by roughly half a decibel.  That is a chosen constant over a
+ * 7.15 dB per-direction spread, not a derived one.
+ *
+ * user_reports_logs/spatial-publish-and-multistream.md, BUG 4. */
+#define SPATIAL_HRTF_PAD 0.72027775f    /* -2.85 dB */
+
 static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStream *iface)
 {
     SpatialAudioStreamImpl *This = impl_from_ISpatialAudioObjectRenderStream(iface);
@@ -978,7 +995,14 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
                 mix_objs[mix_count].buffer = (UINT_PTR)object->buf;
                 mix_objs[mix_count].slot = object->engine_slot;
                 memcpy(mix_objs[mix_count].pos, object->pos, sizeof(object->pos));
-                mix_objs[mix_count].volume = object->volume;
+                /* Scope is structural rather than conditional: this is the
+                 * only line feeding iplBinauralEffectApply, so LFE, an object
+                 * that got no engine slot, one that arrived after the slot
+                 * table filled, and the whole engine-refused fallback are each
+                 * excluded by taking a different branch below.  None of them
+                 * incurred the HRIR gain, so none of them may be padded, and
+                 * no test here can drift out of step with the engine's own. */
+                mix_objs[mix_count].volume = object->volume * SPATIAL_HRTF_PAD;
                 mix_count++;
             }else if(object->type == AudioObjectType_Dynamic){
                 mix_dynamic_object(This, object);
