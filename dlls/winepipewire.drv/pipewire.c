@@ -181,6 +181,10 @@ struct pipewire_stream
     struct spa_hook stream_listener;
     struct spa_audio_info_raw info;
     UINT32 frame_size;
+    /* Small monotonic id for the snapshot, assigned at create.  Not the
+     * pointer: the reader is a different process, so an address tells it
+     * nothing and a recycled allocation would alias two streams. */
+    UINT32 hud_id;
     UINT32 rate_connected; /* negotiated stream rate; SPA_PROP_rate is absolute vs this */
     char last_error[128]; /* set on ERROR callback; emitted once from Wine path */
     BOOL pending_error;
@@ -3436,10 +3440,14 @@ exit:
 
     if (SUCCEEDED(hr))
     {
+        static LONG hud_id_next;
+
+        stream->hud_id = (UINT32)InterlockedIncrement(&hud_id_next);
         list_add_tail(&g_streams, &stream->entry);
         *params->channel_count = stream->info.channels;
         *params->stream = (stream_handle)(UINT_PTR)stream;
-        TRACE("created stream %p, %u channels.\n", stream, stream->info.channels);
+        TRACE("created stream %p id %u, %u channels.\n", stream, stream->hud_id,
+              stream->info.channels);
     }
     else
         WARN("failed: %#x.\n", (unsigned)hr);
@@ -3767,7 +3775,7 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
     struct pwhud_snapshot *snap = hud_snap;
     const struct pipewire_stream *timer_stream = period->timer_stream;
     UINT32 seq = __atomic_load_n(&snap->seq_drv, __ATOMIC_RELAXED);
-    UINT32 under = 0, over = 0, bad = 0, resyncs = 0, count = 0, i;
+    UINT32 under = 0, over = 0, bad = 0, resyncs = 0, count = 0, group_render = 0, i;
     struct pipewire_stream *stream;
 
     /* Deliberately over live streams only, so these answer "how is the audio
@@ -3787,6 +3795,14 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
         resyncs += __atomic_load_n(&stream->ring_resync_count, __ATOMIC_RELAXED);
         count++;
     }
+    /* Started render streams in the elected group, which is the set the peaks
+     * could have come from and the ratio a reader needs to size drv_stream_id
+     * against.  The group is already walked twice per tick below; this is a
+     * third walk of the same short list rather than a fourth data structure,
+     * and it runs once per publish at 10 Hz, not per tick. */
+    LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
+        if (stream->started && stream->dataflow == eRender)
+            group_render++;
     if (!mono_ns)
     {
         struct timespec ts;
@@ -3826,6 +3842,10 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
     for (i = 0; i < PWHUD_OUT_MAX; i++)
         snap->out_peak_db[i] = i < channels ? peak[i] : PWHUD_DB_FLOOR;
     snap->out_channels = channels;
+    /* The subject of every single-stream field above, and the size of the set
+     * it was chosen from.  Inside seqlock A with the rest of section A. */
+    snap->drv_stream_id = timer_stream->hud_id;
+    snap->drv_group_streams = group_render;
 
     __atomic_thread_fence(__ATOMIC_RELEASE);
     __atomic_store_n(&snap->seq_drv, seq + 2, __ATOMIC_RELAXED);

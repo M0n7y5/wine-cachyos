@@ -32,6 +32,12 @@
 #define PWHUD_MAGIC     0x54535750u  /* 'PWST' */
 #define PWHUD_VERSION   1u
 #define PWHUD_BYTES     4096u
+/* The size a version 1 writer has always published at minimum: every field
+ * through sp_bed_db, which is what any reader may assume without consulting
+ * size.  A reader validates against this and not against its own sizeof,
+ * because the append rule is what lets a NEW reader work with an OLD writer
+ * and testing sizeof would reject exactly that case. */
+#define PWHUD_SIZE_V1_BASE 240u
 /* 18, not 16, and not a round number somebody should tidy.
  *
  * AudioObjectType has 17 distinct static positions, FrontLeft 0x2 through
@@ -173,7 +179,7 @@ struct pwhud_snapshot
      * cleared per tick would be missed and its absence would read as "none".
      * The failure path is not counted here; it already reports through
      * ring_op_failed and returns an error to the application.  Claimed from
-     * padding, so every offset and the 240-byte size are unchanged. */
+     * padding, so no existing offset moved. */
     uint32_t drv_ring_resyncs;
 
     uint32_t seq_sp;             /* seqlock B */
@@ -183,9 +189,25 @@ struct pwhud_snapshot
     uint32_t sp_dyn_live;
     uint32_t sp_dyn_max;
     float    sp_bed_db[PWHUD_BED_MAX];
+
+    /* Appended 2026-08-15, after section A published one stream's peaks, ring
+     * and xruns beside a process-wide stream count with nothing naming the
+     * stream, and two independent investigations drew the same wrong
+     * conclusion from it.
+     *
+     * drv_stream_id is a small monotonic counter assigned when the driver
+     * creates a stream, deliberately NOT a pointer: the reader is another
+     * process, so an address is both meaningless and an information leak, and
+     * a recycled allocation would silently alias two streams.  0 means no
+     * stream is elected.  drv_group_streams counts started render streams in
+     * the elected period group, so a reader can see the ratio: id 3 out of 4
+     * says the peaks describe one stream of four.  Both are section A and are
+     * written inside seqlock A. */
+    uint32_t drv_stream_id;
+    uint32_t drv_group_streams;
 };
 
-C_ASSERT(sizeof(struct pwhud_snapshot) == 240);
+C_ASSERT(sizeof(struct pwhud_snapshot) == 248);
 C_ASSERT(sizeof(struct pwhud_snapshot) <= PWHUD_BYTES);
 C_ASSERT(sizeof(struct pwhud_snapshot) % 8 == 0);
 C_ASSERT(sizeof(float) == 4);
@@ -221,6 +243,14 @@ C_ASSERT(offsetof(struct pwhud_snapshot, sp_bed_mask)         == 156);
 C_ASSERT(offsetof(struct pwhud_snapshot, sp_dyn_live)         == 160);
 C_ASSERT(offsetof(struct pwhud_snapshot, sp_dyn_max)          == 164);
 C_ASSERT(offsetof(struct pwhud_snapshot, sp_bed_db)           == 168);
+C_ASSERT(offsetof(struct pwhud_snapshot, drv_stream_id)       == 240);
+C_ASSERT(offsetof(struct pwhud_snapshot, drv_group_streams)   == 244);
+/* The baseline is exactly the end of sp_bed_db.  Pinned, because a reader
+ * validating against it would otherwise be trusting a number that could drift
+ * away from the last field an old writer actually wrote. */
+C_ASSERT(PWHUD_SIZE_V1_BASE == offsetof(struct pwhud_snapshot, sp_bed_db) +
+                               sizeof(((struct pwhud_snapshot *)0)->sp_bed_db));
+C_ASSERT(PWHUD_SIZE_V1_BASE <= sizeof(struct pwhud_snapshot));
 
 /* Replace this publisher's bits and leave the other side's untouched.  A
  * compare-exchange loop, not fetch-and followed by fetch-or: that pair leaves a
