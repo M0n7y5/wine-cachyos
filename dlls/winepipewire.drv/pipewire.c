@@ -3799,7 +3799,7 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
      * could have come from and the ratio a reader needs to size drv_stream_id
      * against.  The group is already walked twice per tick below; this is a
      * third walk of the same short list rather than a fourth data structure,
-     * and it runs once per publish at 10 Hz, not per tick. */
+     * and it runs once per publish, once per elected timer tick. */
     LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
         if (stream->started && stream->dataflow == eRender)
             group_render++;
