@@ -458,9 +458,10 @@ static NTSTATUS spatial_mix(void *args)
  * Tried exactly once.  The driver's process attach is the first unix call
  * mmdevapi makes, and a spatial stream cannot exist before the device it was
  * activated on was enumerated through that driver, so one attempt cannot race
- * creation. */
+ * creation.  Announce arrives from any activating thread, hence the once. */
 static struct pwhud_snapshot *hud_snap;
 static int hud_state;   /* 0 untried, 1 mapped, -1 unavailable */
+static pthread_once_t hud_once = PTHREAD_ONCE_INIT;
 
 static void hud_map_once(void)
 {
@@ -526,8 +527,8 @@ static NTSTATUS spatial_hud_publish(void *args)
     struct pwhud_snapshot *snap;
     UINT32 seq, i;
 
-    if (!hud_state)
-        hud_map_once();
+    /* After the once, hud_state is 1 or -1 and hud_snap is set or NULL; no further sync. */
+    pthread_once(&hud_once, hud_map_once);
     params->enabled = hud_state > 0;
     if (!(snap = hud_snap))
         return STATUS_SUCCESS;
