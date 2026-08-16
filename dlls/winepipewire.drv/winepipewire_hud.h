@@ -48,9 +48,9 @@
  * BackCenter (spatial-audio-test-games.md:11), so a title in the test set sat
  * exactly on the old boundary with no margin.
  *
- * 18 rather than 17 for alignment: 17 floats is 68 bytes and takes sizeof to
+ * 18 rather than 17 for alignment: 17 floats is 68 bytes and ends the array on
  * 236, which fails the sizeof % 8 assertion below and would need a trailing
- * pad field to fix.  18 floats is 72 bytes and lands on 240 with no pad, and
+ * pad field to fix.  18 floats is 72 bytes and ends it on 240 with no pad, and
  * the spare slot sits above the real ceiling rather than inside it.
  *
  * Changed while section B was still unpublished, when it cost one constant
