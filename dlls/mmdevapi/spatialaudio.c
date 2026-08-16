@@ -1655,10 +1655,6 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
                     WINE_UNIX_CALL(unix_spatial_release, &release_params);
                 }
                 if(!obj->engine)
-                    /* Name what actually falls back.  With virtualize_bed set
-                     * the bed pans too, and naming only dynamic objects told a
-                     * reader who stopped here that the consequence was smaller
-                     * than it is. */
                     WARN_(spatial)("HRTF engine unavailable, %s will use stereo panning.\n",
                             obj->virtualize_bed ? "the bed and any dynamic objects"
                                                 : "dynamic objects");
