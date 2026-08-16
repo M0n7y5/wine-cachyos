@@ -221,11 +221,10 @@ static SpatialAudioStreamImpl *hud_stream;
 /* One-way and process-wide on purpose, because both ways of setting it are
  * permanent for the process and neither can turn transient:
  *   - the snapshot file is created only by the driver's hud_init, whose one
- *     call site is pipewire_process_attach (pipewire.c:1079), so it exists
- *     from before the first stream or it never exists;
- *   - the unix side maps at most once, hud_map_once behind if (!hud_state)
- *     (spatial.c:518-519), and nothing resets hud_state, so a failed map is
- *     never retried even if the file did appear.
+ *     call site is pipewire_process_attach, so it exists from before the
+ *     first stream or it never exists;
+ *   - the unix side maps at most once via hud_map_once, and nothing resets
+ *     a failed map, so it is never retried even if the file did appear.
  * Clearing this on stream release would therefore re-learn the same answer at
  * 10 Hz forever, one unixlib transition per tick, and would also restart the
  * per-tick dBFS pass that want_hud gates.  If either half above ever stops
