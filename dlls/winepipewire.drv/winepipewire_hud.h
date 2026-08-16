@@ -71,6 +71,23 @@
  * ABI change; adding a flag bit is not. */
 #define PWHUD_OUT_MAX   8u
 
+/* Started render streams in the elected period group, not a process-wide
+ * list.  Seqlock A has one writer, the elected group's timer thread, so
+ * streams in any other group are out of reach; pw_stream_count versus
+ * drv_group_streams is how a reader sees the unmetered remainder.
+ *
+ * 8, not a guess to tidy later.  Titles that open more than one render
+ * stream still open a handful (Borderlands 3 opens two), and the scan is
+ * ~470 ns per stream, so the cap is a few us of a 10 ms period and only
+ * when WINEPIPEWIRE_HUD=1.  More than 8 in the elected group sets
+ * PWHUD_F_STR_TRUNCATED and drv_str_count is the metered count.  Raising
+ * this is an ABI change; the flag is not. */
+#define PWHUD_STR_MAX   8u
+
+/* First size that includes drv_str[].  A reader that wants those rows
+ * tests size against this, not against sizeof. */
+#define PWHUD_SIZE_V1_STR 584u
+
 /* $HOME is bind-mounted into the Steam pressure-vessel container at the same
  * path; $XDG_RUNTIME_DIR is reconstructed there with only selected sockets
  * bound in, so it is not a shared drop point.  The pid disambiguates the
@@ -88,6 +105,8 @@
 #define PWHUD_F_NO_DSP_LOAD    0x20u /* pw_dsp_load is not implemented, so 0.0 means "not
                                       * measured" and must be rendered as unavailable.
                                       * Scoped to that one field so it can be cleared alone */
+#define PWHUD_F_STR_TRUNCATED  0x40u /* elected group has more started render streams than
+                                      * PWHUD_STR_MAX; drv_str_count is the metered count */
 
 /* flags is one word with two publishers, so it is partitioned by owner and the
  * partition is checked at compile time rather than remembered.  Adding a bit
@@ -99,9 +118,10 @@
  * 10 Hz, so a B bit survived at most one tick in ten.  Both sides now go
  * through pwhud_flags_publish below and touch only their own mask. */
 #define PWHUD_F_ALL (PWHUD_F_CAPTURE | PWHUD_F_GRID_VALID | PWHUD_F_OUT_TRUNCATED | \
-                     PWHUD_F_BED_TRUNCATED | PWHUD_F_OUT_NO_METER | PWHUD_F_NO_DSP_LOAD)
+                     PWHUD_F_BED_TRUNCATED | PWHUD_F_OUT_NO_METER | PWHUD_F_NO_DSP_LOAD | \
+                     PWHUD_F_STR_TRUNCATED)
 #define PWHUD_F_MASK_A (PWHUD_F_CAPTURE | PWHUD_F_GRID_VALID | PWHUD_F_OUT_TRUNCATED | \
-                        PWHUD_F_OUT_NO_METER | PWHUD_F_NO_DSP_LOAD)
+                        PWHUD_F_OUT_NO_METER | PWHUD_F_NO_DSP_LOAD | PWHUD_F_STR_TRUNCATED)
 #define PWHUD_F_MASK_B (PWHUD_F_BED_TRUNCATED)
 
 C_ASSERT((PWHUD_F_MASK_A & PWHUD_F_MASK_B) == 0);
@@ -111,9 +131,19 @@ C_ASSERT((PWHUD_F_MASK_A | PWHUD_F_MASK_B) == PWHUD_F_ALL);
 #define PWHUD_DISPATCH_DATA    1u
 #define PWHUD_DISPATCH_LOOP    2u
 
-/* Silence, and the value of every unused out_peak_db/sp_bed_db slot: a meter
- * plots this, where -INFINITY would collapse its range. */
+/* Silence, and the value of every unused out_peak_db/sp_bed_db/drv_str
+ * peak_db slot: a meter plots this, where -INFINITY would collapse its range. */
 #define PWHUD_DB_FLOOR (-120.0f)
+
+/* One started render stream in the elected group.  id is the same monotonic
+ * counter as drv_stream_id, not a pointer.  channels is the metered width,
+ * at most PWHUD_OUT_MAX, and 0 means this tick had nothing to scan. */
+struct pwhud_str
+{
+    uint32_t id;
+    uint32_t channels;
+    float    peak_db[PWHUD_OUT_MAX];
+};
 
 /* Byte identical under -m32 and -m64: fixed width only, and every 64-bit
  * field sits at an offset divisible by 8 because the System V i386 ABI aligns
@@ -223,9 +253,17 @@ struct pwhud_snapshot
      * mixed, and publishes nonzero means the bed values above are live. */
     uint32_t sp_clients;
     uint32_t sp_publishes;
+
+    /* Per-stream meters, section A.  out_peak_db stays the elected stream so
+     * existing readers are unchanged.  Only the elected group's started
+     * render streams; other groups are outside this writer. */
+    uint32_t drv_str_count;
+    uint32_t drv_str_pad;        /* keeps drv_str 8-aligned; unused */
+    struct pwhud_str drv_str[PWHUD_STR_MAX];
 };
 
-C_ASSERT(sizeof(struct pwhud_snapshot) == 256);
+C_ASSERT(sizeof(struct pwhud_str) == 40);
+C_ASSERT(sizeof(struct pwhud_snapshot) == 584);
 C_ASSERT(sizeof(struct pwhud_snapshot) <= PWHUD_BYTES);
 C_ASSERT(sizeof(struct pwhud_snapshot) % 8 == 0);
 C_ASSERT(sizeof(float) == 4);
@@ -265,12 +303,24 @@ C_ASSERT(offsetof(struct pwhud_snapshot, drv_stream_id)       == 240);
 C_ASSERT(offsetof(struct pwhud_snapshot, drv_group_streams)   == 244);
 C_ASSERT(offsetof(struct pwhud_snapshot, sp_clients)          == 248);
 C_ASSERT(offsetof(struct pwhud_snapshot, sp_publishes)        == 252);
+C_ASSERT(offsetof(struct pwhud_str, id)                       ==   0);
+C_ASSERT(offsetof(struct pwhud_str, channels)                 ==   4);
+C_ASSERT(offsetof(struct pwhud_str, peak_db)                  ==   8);
+C_ASSERT(offsetof(struct pwhud_snapshot, drv_str_count)       == 256);
+C_ASSERT(offsetof(struct pwhud_snapshot, drv_str_pad)         == 260);
+C_ASSERT(offsetof(struct pwhud_snapshot, drv_str)             == 264);
+C_ASSERT(offsetof(struct pwhud_snapshot, drv_str[0].id)       == 264);
+C_ASSERT(offsetof(struct pwhud_snapshot, drv_str[0].channels) == 268);
+C_ASSERT(offsetof(struct pwhud_snapshot, drv_str[0].peak_db)  == 272);
 /* The baseline is exactly the end of sp_bed_db.  Pinned, because a reader
  * validating against it would otherwise be trusting a number that could drift
  * away from the last field an old writer actually wrote. */
 C_ASSERT(PWHUD_SIZE_V1_BASE == offsetof(struct pwhud_snapshot, sp_bed_db) +
                                sizeof(((struct pwhud_snapshot *)0)->sp_bed_db));
 C_ASSERT(PWHUD_SIZE_V1_BASE <= sizeof(struct pwhud_snapshot));
+C_ASSERT(PWHUD_SIZE_V1_STR == offsetof(struct pwhud_snapshot, drv_str) +
+                             sizeof(((struct pwhud_snapshot *)0)->drv_str));
+C_ASSERT(PWHUD_SIZE_V1_STR <= sizeof(struct pwhud_snapshot));
 
 /* Replace this publisher's bits and leave the other side's untouched.  A
  * compare-exchange loop, not fetch-and followed by fetch-or: that pair leaves a

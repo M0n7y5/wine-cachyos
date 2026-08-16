@@ -3770,12 +3770,13 @@ static UINT32 hud_render_peaks(const struct pipewire_stream *stream, float *peak
  * whose jitter the snapshot exists to measure. */
 static void hud_publish(const struct pipewire_period *period, const struct pw_time *pwt,
                         BOOL have_time, INT64 adjust, UINT64 mono_ns,
-                        const float *peak, UINT32 channels, UINT32 out_flags)
+                        const float *peak, UINT32 channels, UINT32 out_flags,
+                        const struct pwhud_str *str, UINT32 str_count)
 {
     struct pwhud_snapshot *snap = hud_snap;
     const struct pipewire_stream *timer_stream = period->timer_stream;
     UINT32 seq = __atomic_load_n(&snap->seq_drv, __ATOMIC_RELAXED);
-    UINT32 under = 0, over = 0, bad = 0, resyncs = 0, count = 0, group_render = 0, i;
+    UINT32 under = 0, over = 0, bad = 0, resyncs = 0, count = 0, group_render = 0, i, j;
     struct pipewire_stream *stream;
 
     /* Deliberately over live streams only, so these answer "how is the audio
@@ -3795,11 +3796,11 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
         resyncs += __atomic_load_n(&stream->ring_resync_count, __ATOMIC_RELAXED);
         count++;
     }
-    /* Started render streams in the elected group, which is the set the peaks
-     * could have come from and the ratio a reader needs to size drv_stream_id
-     * against.  The group is already walked twice per tick below; this is a
-     * third walk of the same short list rather than a fourth data structure,
-     * and it runs once per publish, once per elected timer tick. */
+    /* Started render streams in the elected group.  drv_str_count is the
+     * metered prefix of this, at most PWHUD_STR_MAX.  The group is already
+     * walked twice per tick below; this is a third walk of the same short
+     * list rather than a fourth data structure, and it runs once per publish,
+     * once per elected timer tick. */
     LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
         if (stream->started && stream->dataflow == eRender)
             group_render++;
@@ -3846,6 +3847,20 @@ static void hud_publish(const struct pipewire_period *period, const struct pw_ti
      * it was chosen from.  Inside seqlock A with the rest of section A. */
     snap->drv_stream_id = timer_stream->hud_id;
     snap->drv_group_streams = group_render;
+    snap->drv_str_count = str_count;
+    snap->drv_str_pad = 0;
+    for (i = 0; i < PWHUD_STR_MAX; i++)
+    {
+        if (i < str_count)
+            snap->drv_str[i] = str[i];
+        else
+        {
+            snap->drv_str[i].id = 0;
+            snap->drv_str[i].channels = 0;
+            for (j = 0; j < PWHUD_OUT_MAX; j++)
+                snap->drv_str[i].peak_db[j] = PWHUD_DB_FLOOR;
+        }
+    }
 
     __atomic_thread_fence(__ATOMIC_RELEASE);
     __atomic_store_n(&snap->seq_drv, seq + 2, __ATOMIC_RELAXED);
@@ -3867,7 +3882,8 @@ static void pipewire_period_timer_loop(void *args)
         UINT64 mono_ns = 0;
         int have_now = 0, have_time = 0;
         float hud_peak[PWHUD_OUT_MAX] = { 0.0f };
-        UINT32 hud_channels = 0, hud_out_flags = 0;
+        struct pwhud_str hud_str[PWHUD_STR_MAX];
+        UINT32 hud_channels = 0, hud_out_flags = 0, hud_str_count = 0;
         BOOL hud_publishing = FALSE;
 
         NtDelayExecution(FALSE, &delay);
@@ -3958,23 +3974,22 @@ static void pipewire_period_timer_loop(void *args)
         }
         delay.QuadPart = -((INT64)period->period_usec + adjust) * 10;
 
-        /* The peak has to come off the ring before the drain below retires the
-         * period it describes.  After the drain lcl_offs_bytes has moved past
+        /* Peaks have to come off the ring before the drain below retires the
+         * period they describe.  After the drain lcl_offs_bytes has moved past
          * those bytes and held_bytes is zero for any client that keeps a single
          * period queued, which is every client that writes one period per
          * event, mmdevapi's own spatial renderer among them: the scan then had
-         * nothing to look at and published no channels at all.  Electing the
-         * publisher here rather than at the publish keeps that choice
-         * unchanged while letting the scan run only for the group that will
-         * actually publish. */
+         * nothing to look at and published no channels at all.  Every started
+         * render stream in this group is scanned, not only the elected one;
+         * other period groups are outside this writer.  Electing the publisher
+         * here rather than at the publish keeps that choice unchanged while
+         * letting the scan run only for the group that will actually publish. */
         if (hud_snap && period->timer_stream)
         {
             if (!hud_period || !hud_period->timer_stream)
                 hud_period = period;
             hud_publishing = hud_period == period;
         }
-        if (hud_publishing && period->timer_stream->dataflow == eRender)
-            hud_channels = hud_render_peaks(period->timer_stream, hud_peak, &hud_out_flags);
 
         LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
         {
@@ -3983,6 +3998,34 @@ static void pipewire_period_timer_loop(void *args)
             if (stream->dataflow == eRender)
             {
                 UINT32 adv = min(stream->period_bytes, stream->held_bytes);
+
+                if (hud_publishing)
+                {
+                    if (hud_str_count < PWHUD_STR_MAX)
+                    {
+                        UINT32 str_flags = 0, c;
+
+                        hud_str[hud_str_count].id = stream->hud_id;
+                        hud_str[hud_str_count].channels =
+                            hud_render_peaks(stream, hud_str[hud_str_count].peak_db, &str_flags);
+                        for (c = hud_str[hud_str_count].channels; c < PWHUD_OUT_MAX; c++)
+                            hud_str[hud_str_count].peak_db[c] = PWHUD_DB_FLOOR;
+                        if (stream == period->timer_stream)
+                        {
+                            hud_channels = hud_str[hud_str_count].channels;
+                            hud_out_flags |= str_flags;
+                            for (c = 0; c < PWHUD_OUT_MAX; c++)
+                                hud_peak[c] = hud_str[hud_str_count].peak_db[c];
+                        }
+                        hud_str_count++;
+                    }
+                    else
+                    {
+                        hud_out_flags |= PWHUD_F_STR_TRUNCATED;
+                        if (stream == period->timer_stream)
+                            hud_channels = hud_render_peaks(stream, hud_peak, &hud_out_flags);
+                    }
+                }
 
                 stream->lcl_offs_bytes += adv;
                 stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
@@ -4027,7 +4070,8 @@ static void pipewire_period_timer_loop(void *args)
          * election itself ran before the drain, with the peak scan. */
         if (hud_publishing)
             hud_publish(period, &pwt, have_time, adjust, mono_ns,
-                        hud_peak, hud_channels, hud_out_flags);
+                        hud_peak, hud_channels, hud_out_flags,
+                        hud_str, hud_str_count);
 
         pw_thread_loop_unlock(pw_loop_global);
     }
