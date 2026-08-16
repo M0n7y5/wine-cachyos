@@ -153,8 +153,7 @@ struct pwhud_snapshot
      * starving is drv_underruns, a different failure with a different fix.
      *
      * A count of observed episodes.  The underlying signal is spa_io_clock.xrun,
-     * an accumulated duration in samples at the clock rate, so a future field
-     * could carry milliseconds without rediscovering that; one episode here is
+     * an accumulated duration in samples at the clock rate; one episode here is
      * one increase of that accumulator, however many quanta it spans. */
     uint32_t pw_xruns;
     uint32_t pw_stream_count;
