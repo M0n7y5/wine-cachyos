@@ -490,10 +490,11 @@ static void hud_map_once(void)
         return;
     }
     /* The creator stamps magic last, so a valid magic means the header is
-     * complete.  size guards against writing section B into a shorter file
-     * left by an older build. */
+     * complete.  size is tested against PWHUD_SIZE_V1_BASE, not sizeof: the
+     * append rule is what lets a newer build write section B into an older
+     * writer's page, and testing sizeof would reject exactly that case. */
     if (__atomic_load_n(&snap->magic, __ATOMIC_ACQUIRE) != PWHUD_MAGIC ||
-        snap->version > PWHUD_VERSION || snap->size < sizeof(*snap))
+        snap->version > PWHUD_VERSION || snap->size < PWHUD_SIZE_V1_BASE)
     {
         WARN("%s is not a usable snapshot (magic %#x version %u size %u)\n", path,
              snap->magic, snap->version, snap->size);
