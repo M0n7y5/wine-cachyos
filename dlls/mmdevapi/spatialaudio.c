@@ -210,8 +210,8 @@ struct SpatialAudioImpl {
 };
 
 /* Section B of the shared snapshot.  Exactly one stream publishes, because the
- * snapshot holds one stream's worth of bed.  The WINE_SPATIAL_STATS text writer
- * below is per-process, so with two spatial streams whichever one called
+ * snapshot holds one stream's worth of bed.  The previous text writer
+ * was per-process, so with two spatial streams whichever one called
  * EndUpdatingAudioObjects last in the period silently overwrote the other's
  * channels.  Electing one stream makes which stream you are reading
  * deterministic instead of a race, and a second stream is reported once so the
@@ -726,29 +726,6 @@ static void mix_dynamic_object(SpatialAudioStreamImpl *stream, SpatialAudioObjec
     }
 }
 
-/* ----------------------------------------------------------------------
- * Per-channel level stats for an external debug overlay.  Opt-in via the
- * WINE_SPATIAL_STATS env var (a unix path); a dedicated writer thread emits a
- * one-line snapshot so the audio thread never does file I/O.
- * ---------------------------------------------------------------------- */
-
-static struct {
-    volatile LONG started;     /* 0 unstarted, 2 initializing, 1 running, -1 disabled */
-    volatile LONG seq;         /* bumped each update; the writer uses it for liveness */
-    WCHAR path[MAX_PATH];
-    float db[SPATIAL_BED_MAX]; /* per AudioObjectType_to_index dBFS */
-    BOOL present[SPATIAL_BED_MAX];
-    volatile LONG hrtf, bed, dyn_live, dyn_max;
-} spatial_stats;
-
-static const char *spatial_channel_name(UINT32 idx)
-{
-    static const char *const names[] = {
-        "FL", "FR", "FC", "LFE", "SL", "SR", "BL", "BR",
-        "TFL", "TFR", "TBL", "TBR", "BFL", "BFR", "BBL", "BBR", "BC" };
-    return idx < ARRAY_SIZE(names) ? names[idx] : "?";
-}
-
 static float spatial_channel_dbfs(const float *buf, UINT32 frames)
 {
     double s = 0.0;
@@ -764,81 +741,6 @@ static float spatial_channel_dbfs(const float *buf, UINT32 frames)
      * value no consumer can plot, compare or average. */
     if(!isfinite(s) || s <= 1e-6) return SPATIAL_DB_FLOOR;
     return (float)(20.0 * log10(s));
-}
-
-static BOOL spatial_stats_dos_path(WCHAR *out, DWORD cch)
-{
-    WCHAR env[MAX_PATH];
-    DWORD i, n = GetEnvironmentVariableW(L"WINE_SPATIAL_STATS", env, ARRAY_SIZE(env));
-    if(!n || n >= ARRAY_SIZE(env)) return FALSE;
-    if(env[0] == '/'){                 /* unix path -> Z: drive (Z: maps to /) */
-        if(n + 3 >= cch) return FALSE;
-        out[0] = 'Z'; out[1] = ':';
-        for(i = 0; env[i]; ++i) out[i + 2] = env[i] == '/' ? '\\' : env[i];
-        out[i + 2] = 0;
-    }else
-        lstrcpynW(out, env, cch);
-    return TRUE;
-}
-
-static DWORD WINAPI spatial_stats_writer(void *arg)
-{
-    WCHAR tmp[MAX_PATH];
-    DWORD lastseq = ~0;
-    int idle = 0;
-
-    lstrcpynW(tmp, spatial_stats.path, ARRAY_SIZE(tmp) - 5);
-    lstrcatW(tmp, L".tmp");
-
-    for(;;){
-        char line[512];
-        HANDLE h;
-        DWORD wr;
-        int len, i;
-
-        Sleep(100);
-        if((DWORD)spatial_stats.seq == lastseq){ if(idle < 50) ++idle; }
-        else { idle = 0; lastseq = spatial_stats.seq; }
-
-        len = snprintf(line, sizeof(line), "hrtf:%ld bed:%ld dyn:%ld/%ld",
-                spatial_stats.hrtf, spatial_stats.bed,
-                spatial_stats.dyn_live, spatial_stats.dyn_max);
-        if(idle < 5){
-            for(i = 0; i < SPATIAL_BED_MAX && len < (int)sizeof(line) - 16; ++i)
-                if(spatial_stats.present[i])
-                    len += snprintf(line + len, sizeof(line) - len, " %s:%.1f",
-                            spatial_channel_name(i), spatial_stats.db[i]);
-        }else
-            len += snprintf(line + len, sizeof(line) - len, " idle");
-        if(len < (int)sizeof(line) - 1) line[len++] = '\n';
-
-        h = CreateFileW(tmp, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if(h != INVALID_HANDLE_VALUE){
-            WriteFile(h, line, len, &wr, NULL);
-            CloseHandle(h);
-            MoveFileExW(tmp, spatial_stats.path, MOVEFILE_REPLACE_EXISTING);
-        }
-    }
-    return 0;
-}
-
-static void spatial_stats_start(void)
-{
-    HANDLE t;
-    HMODULE mod;
-    if(InterlockedCompareExchange(&spatial_stats.started, 2, 0) != 0) return;
-    /* the writer runs until the process exits, so the module it returns into
-     * must stay mapped */
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-            (const WCHAR *)spatial_stats_writer, &mod);
-    if(spatial_stats_dos_path(spatial_stats.path, ARRAY_SIZE(spatial_stats.path)) &&
-            (t = CreateThread(NULL, 0, spatial_stats_writer, NULL, 0, NULL))){
-        CloseHandle(t);
-        TRACE("Writing spatial channel stats to %s\n", debugstr_w(spatial_stats.path));
-        InterlockedExchange(&spatial_stats.started, 1);
-    }else
-        InterlockedExchange(&spatial_stats.started, -1);
 }
 
 static BOOL spatial_hud_claim(SpatialAudioStreamImpl *stream)
@@ -877,17 +779,16 @@ static BOOL spatial_hud_due(SpatialAudioStreamImpl *stream)
     return TRUE;
 }
 
-/* One dBFS pass feeds both sinks, so the text file and section B can never
- * disagree and the audio thread never computes the levels twice. */
-static void spatial_stats_update(SpatialAudioStreamImpl *stream)
+/* One dBFS pass computes the levels the HUD publish consumes; the audio thread
+ * never computes them twice. */
+static void spatial_hud_update(SpatialAudioStreamImpl *stream)
 {
     struct spatial_hud_params hud;
     SpatialAudioObjectImpl *object;
-    BOOL want_file = spatial_stats.started == 1;
-    BOOL want_hud = spatial_hud_due(stream);
+    BOOL unix_up;
     int i;
 
-    if(!want_file && !want_hud) return;
+    if(!spatial_hud_due(stream)) return;
 
     for(i = 0; i < SPATIAL_BED_MAX; ++i) hud.bed_db[i] = SPATIAL_DB_FLOOR;
     hud.bed_mask = 0;
@@ -912,35 +813,22 @@ static void spatial_stats_update(SpatialAudioStreamImpl *stream)
     hud.dyn_max = stream->dyn_max;
     hud.announce = 0;
 
-    if(want_file){
-        for(i = 0; i < SPATIAL_BED_MAX; ++i){
-            spatial_stats.present[i] = (hud.bed_mask >> i) & 1;
-            spatial_stats.db[i] = hud.bed_db[i];
-        }
-        spatial_stats.hrtf = hud.hrtf;
-        spatial_stats.bed = hud.bed_virtualized;
-        spatial_stats.dyn_live = hud.dyn_live;
-        spatial_stats.dyn_max = hud.dyn_max;
-        InterlockedIncrement(&spatial_stats.seq);
-    }
-    if(want_hud){
-        /* Activation has already initialised the unixlib for every stream
-         * that reaches here, so this is a cached flag read.  It stays to hold
-         * "never dispatch without a handle" at the call site: a stream that
-         * dispatches on a zero handle faults inside the unix-call frame, and
-         * the ignored STATUS_ACCESS_VIOLATION latches hud_off process-wide. */
-        BOOL unix_up = spatial_unix_init();
+    /* Activation has already initialised the unixlib for every stream
+     * that reaches here, so this is a cached flag read.  It stays to hold
+     * "never dispatch without a handle" at the call site: a stream that
+     * dispatches on a zero handle faults inside the unix-call frame, and
+     * the ignored STATUS_ACCESS_VIOLATION latches hud_off process-wide. */
+    unix_up = spatial_unix_init();
 
-        hud.enabled = 0;
-        if(unix_up)
-            WINE_UNIX_CALL(unix_spatial_hud_publish, &hud);
-        if(!hud.enabled){
-            if(!InterlockedExchange(&hud_off, 1))
-                WARN_(spatial)("Section B is inert for this process: %s.\n", unix_up ?
-                        "the driver published no snapshot to write into" :
-                        "the mmdevapi unixlib did not initialise");
-            InterlockedCompareExchangePointer((void **)&hud_stream, NULL, stream);
-        }
+    hud.enabled = 0;
+    if(unix_up)
+        WINE_UNIX_CALL(unix_spatial_hud_publish, &hud);
+    if(!hud.enabled){
+        if(!InterlockedExchange(&hud_off, 1))
+            WARN_(spatial)("Section B is inert for this process: %s.\n", unix_up ?
+                    "the driver published no snapshot to write into" :
+                    "the mmdevapi unixlib did not initialise");
+        InterlockedCompareExchangePointer((void **)&hud_stream, NULL, stream);
     }
 }
 
@@ -983,8 +871,6 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
          * mix_static_object writes anywhere else, so this flag is exactly
          * "something non-transparent landed on the bus this tick". */
         BOOL bus_dirty = FALSE;
-
-        if(!spatial_stats.started) spatial_stats_start();
 
         LIST_FOR_EACH_ENTRY(object, &This->objects, SpatialAudioObjectImpl, entry){
             if(object->invalidated && !object->eos_pending)
@@ -1078,7 +964,7 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
                 if(*r > 1.0f) *r = 1.0f; else if(*r < -1.0f) *r = -1.0f;
             }
         }
-        spatial_stats_update(This);
+        spatial_hud_update(This);
 
         /* an object that misses an update cycle is invalidated */
         LIST_FOR_EACH_ENTRY(object, &This->objects, SpatialAudioObjectImpl, entry){
