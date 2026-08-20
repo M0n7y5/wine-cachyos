@@ -185,7 +185,12 @@ struct pipewire_stream
      * pointer: the reader is a different process, so an address tells it
      * nothing and a recycled allocation would alias two streams. */
     UINT32 hud_id;
-    UINT32 rate_connected; /* negotiated stream rate; SPA_PROP_rate is absolute vs this */
+    /* Rate this stream connected at, which is the requested rate and not a
+     * read-back: spa_format_audio_raw_build emits a fully fixed pod, so the
+     * adapter inserts a converter rather than counter-proposing, and there is
+     * no param_changed handler that could learn anything else.  SPA_PROP_rate
+     * is a ratio against this. */
+    UINT32 rate_connected;
     char last_error[128]; /* set on ERROR callback; emitted once from Wine path */
     BOOL pending_error;
 
