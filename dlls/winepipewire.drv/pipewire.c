@@ -101,7 +101,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(pipewire);
  * anything above PA_RATE_MAX): the rate reaches nSamplesPerSec in the mix
  * format applications hand back to Initialize, where it scales every buffer
  * allocation and wraps nAvgBytesPerSec.  The quantum only feeds the
- * advertised IAudioClient3 minimum, which build_device_cache clamps again. */
+ * advertised IAudioClient3 minimum period. */
 #define PW_MIN_CLOCK_RATE 8000
 #define PW_MAX_RATE       384000
 #define PW_MAX_QUANTUM    65536
@@ -1327,6 +1327,7 @@ struct probe
     char default_source[256];
     uint32_t clock_rate;
     uint32_t min_quantum;
+    uint32_t force_quantum; /* clock.force-quantum pins the graph: floor and ceiling */
     BOOL core_error;
     BOOL truncated;        /* a global was dropped by PROBE_MAX_GLOBALS */
 };
@@ -1432,9 +1433,9 @@ static int on_probe_settings_property(void *data, uint32_t subject, const char *
     else if (!strcmp(key, "clock.force-quantum"))
     {
         if (parse_u32(value, 10, 1, PW_MAX_QUANTUM, &v))
-            p->min_quantum = v;
+            p->force_quantum = v;
     }
-    else if (!strcmp(key, "clock.min-quantum") && !p->min_quantum)
+    else if (!strcmp(key, "clock.min-quantum"))
     {
         if (parse_u32(value, 10, 1, PW_MAX_QUANTUM, &v))
             p->min_quantum = v;
@@ -1803,15 +1804,23 @@ static void build_device_cache(struct probe *p)
     REFERENCE_TIME min_period = 30000;
     UINT index = 0;
 
-    /* IAudioClient3 shared-mode floor.  The graph cannot deliver cycles
-     * below clock.min-quantum (clock.force-quantum pins it outright), and
-     * 128 frames (~2.7 ms at 48 kHz) matches the typical Windows engine
-     * floor.  Clamp to the 3 ms winepulse-parity value so the advertised
-     * minimum only ever improves; without settings metadata keep 3 ms. */
-    if (p->min_quantum)
+    /* IAudioClient3 shared-mode floor.  clock.force-quantum pins the graph
+     * cycle, so it is a hard ceiling as much as a hard floor and takes no
+     * 3 ms clamp: under-advertising a pinned quantum makes clients size
+     * buffers the graph cannot fill in one cycle.  clock.min-quantum is only
+     * a hint, so that path keeps the 128 frame floor (~2.7 ms at 48 kHz,
+     * matching the typical Windows engine floor) and the 3 ms
+     * winepulse-parity ceiling.  Without settings metadata keep 3 ms.  Both
+     * conversions floor because mmdevapi converts back with a ceiling, so
+     * they round-trip to the exact frame count. */
+    if (p->force_quantum)
     {
-        /* Floor division: mmdevapi converts back with a ceiling, so this
-         * round-trips to the exact frame count. */
+        min_period = (REFERENCE_TIME)p->force_quantum * 10000000 / rate;
+        TRACE("force_quantum=%u rate=%u -> min_period=%d hns\n",
+              p->force_quantum, rate, (int)min_period);
+    }
+    else if (p->min_quantum)
+    {
         REFERENCE_TIME q = (REFERENCE_TIME)p->min_quantum * 10000000 / rate;
         REFERENCE_TIME floor_rt = (REFERENCE_TIME)128 * 10000000 / rate;
         min_period = q > floor_rt ? q : floor_rt;
