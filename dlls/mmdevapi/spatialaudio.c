@@ -683,7 +683,8 @@ static HRESULT WINAPI SAORS_GetAvailableDynamicObjectCount(
         return E_POINTER;
 
     EnterCriticalSection(&This->lock);
-    *count = This->dyn_max - This->dyn_live;
+    /* Same source as Begin's out parameter, which Windows requires. */
+    *count = This->dyn_max;
     LeaveCriticalSection(&This->lock);
     return S_OK;
 }
@@ -858,7 +859,13 @@ static HRESULT WINAPI SAORS_BeginUpdatingAudioObjects(ISpatialAudioObjectRenderS
         FIXME("Zero frame update.\n");
     }
 
-    *dyn_count = This->dyn_max - This->dyn_live;
+    /* The grant, not the remaining capacity: Windows answers this from the
+     * server's per-pass grant, which activation never decrements, so an app
+     * holding every object it was granted still reads the full number.
+     * Reporting the remainder made Dying Light 2 read 0 on its second pass
+     * and rebuild its whole spatial sink once per frame, in silence, forever.
+     * Activation stays the gate; see SAORS_ActivateSpatialAudioObject. */
+    *dyn_count = This->dyn_max;
     *frames = This->update_frames;
 
     LeaveCriticalSection(&This->lock);
