@@ -255,8 +255,8 @@ struct pipewire_stream
     UINT32 pw_xrun_count;
     UINT32 ring_warned;   /* RING_OP_* bits already reported for this stream */
     UINT32 cb_seq;        /* callback-private: callbacks entered */
-    UINT32 cb_mark;       /* diagnostic breadcrumb, never read by the driver */
-    BOOL underrun_logged, overrun_logged, bad_buffer_logged;
+    UINT32 cb_mark;       /* diagnostic breadcrumb: phase of the last callback */
+    BOOL underrun_logged, overrun_logged, bad_buffer_logged, pw_xrun_logged;
 
     /* journal_w: producer counter, atomic, bumped from the PW callback.
      * journal_r: consumer cursor, Wine threads only, under the loop lock. */
@@ -3505,16 +3505,17 @@ static NTSTATUS pipewire_release_stream(void *args)
         UINT32 under = __atomic_load_n(&stream->underrun_count, __ATOMIC_RELAXED);
         UINT32 over = __atomic_load_n(&stream->overrun_count, __ATOMIC_RELAXED);
         UINT32 bad = __atomic_load_n(&stream->bad_buffer_count, __ATOMIC_RELAXED);
+        UINT32 xruns = __atomic_load_n(&stream->pw_xrun_count, __ATOMIC_RELAXED);
         UINT32 mark = __atomic_load_n(&stream->cb_mark, __ATOMIC_RELAXED);
         const char *err = stream->last_error[0] ? stream->last_error : NULL;
 
         stream_journal_flush(stream);
         TRACE("stream %p final cb_seq %u last phase %u last_error %s.\n", stream,
               stream->cb_seq, mark & 3, debugstr_a(err));
-        if (under || over || bad)
+        if (under || over || bad || xruns)
             WARN("stream %p underran %u times, overran %u times, bad buffers %u, "
-                 "cb_seq %u last phase %u last_error %s.\n", stream,
-                 under, over, bad, stream->cb_seq, mark & 3, debugstr_a(err));
+                 "graph xruns %u, cb_seq %u last phase %u last_error %s.\n", stream,
+                 under, over, bad, xruns, stream->cb_seq, mark & 3, debugstr_a(err));
     }
     if (stream->period)
     {
@@ -4113,6 +4114,15 @@ static void pipewire_period_timer_loop(void *args)
             {
                 WARN("stream %p first bad process buffer (count %u).\n", stream, n);
                 stream->bad_buffer_logged = TRUE;
+            }
+            /* The graph driver missing its deadline and our own ring starving
+             * are different bug reports, so name them apart in the log rather
+             * than only in the HUD snapshot. */
+            if ((n = __atomic_load_n(&stream->pw_xrun_count, __ATOMIC_RELAXED)) &&
+                !stream->pw_xrun_logged)
+            {
+                WARN("stream %p first graph xrun (count %u).\n", stream, n);
+                stream->pw_xrun_logged = TRUE;
             }
             if (stream->event)
                 NtSetEvent(stream->event, NULL);
