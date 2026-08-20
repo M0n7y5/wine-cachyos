@@ -295,7 +295,7 @@ static void test_audio_object_buffers(void)
     SpatialAudioObjectRenderStreamActivationParams activation_params;
     ISpatialAudioObjectRenderStream *sas = NULL;
     PROPVARIANT activation_params_prop;
-    ISpatialAudioObject *sao[4];
+    ISpatialAudioObject *sao[4], *sao_unwritten;
     BYTE *buffer;
     INT i, j, k;
     HRESULT hr;
@@ -324,6 +324,11 @@ static void test_audio_object_buffers(void)
     max_frame_count = frame_count + frame_count / 4;
 
     hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_FrontLeft, &sao[0]);
+    ok(hr == S_OK, "Failed to activate spatial audio object: 0x%08lx\n", hr);
+
+    /* activated up front and never written: a caller may pre-activate a pool
+     * and only write an object once it has content for it */
+    hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_BackLeft, &sao_unwritten);
     ok(hr == S_OK, "Failed to activate spatial audio object: 0x%08lx\n", hr);
 
     hr = ISpatialAudioObjectRenderStream_Start(sas);
@@ -450,6 +455,11 @@ static void test_audio_object_buffers(void)
     hr = ISpatialAudioObject_GetBuffer(sao[ARRAYSIZE(sao) - 1], &buffer, &buffer_length);
     ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED, "Expected audio object to be invalidated: 0x%08lx\n", hr);
 
+    /* an object whose lifetime never started is not invalidated by the passes
+     * it sat out: its first GetBuffer still has to succeed */
+    hr = ISpatialAudioObject_GetBuffer(sao_unwritten, &buffer, &buffer_length);
+    ok(hr == S_OK, "Expected a buffer for a never written audio object: 0x%08lx\n", hr);
+
     for (i = 0; i < ARRAYSIZE(sao) - 1; i++)
     {
         hr = ISpatialAudioObject_GetBuffer(sao[i], &buffer, &buffer_length);
@@ -487,7 +497,7 @@ static void test_audio_object_buffers(void)
     ok(hr == S_OK, "got %#lx.\n", hr);
 
     hr = ISpatialAudioObjectRenderStream_Reset(sas);
-    todo_wine ok(hr == S_OK, "got %#lx.\n", hr);
+    ok(hr == S_OK, "got %#lx.\n", hr);
 
     hr = ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(sas);
     ok(hr == S_OK, "got %#lx.\n", hr);
@@ -499,6 +509,7 @@ static void test_audio_object_buffers(void)
     {
         ISpatialAudioObject_Release(sao[i]);
     }
+    ISpatialAudioObject_Release(sao_unwritten);
 
     ISpatialAudioObjectRenderStream_Release(sas);
 }

@@ -109,7 +109,6 @@ typedef struct {
 } IPLBinauralEffectParams;
 
 #define STEAMAUDIO_VERSION ((4u << 16) | (8u << 8) | 1u)
-#define IPL_AUDIOEFFECTSTATE_TAILCOMPLETE 1
 
 static int (*p_iplContextCreate)(IPLContextSettings *, IPLContext *);
 static void (*p_iplContextRelease)(IPLContext *);
@@ -117,6 +116,7 @@ static int (*p_iplHRTFCreate)(IPLContext, IPLAudioSettings *, IPLHRTFSettings *,
 static void (*p_iplHRTFRelease)(IPLHRTF *);
 static int (*p_iplBinauralEffectCreate)(IPLContext, IPLAudioSettings *, IPLBinauralEffectSettings *, IPLBinauralEffect *);
 static int (*p_iplBinauralEffectApply)(IPLBinauralEffect, IPLBinauralEffectParams *, IPLAudioBuffer *, IPLAudioBuffer *);
+static int (*p_iplBinauralEffectGetTailSize)(IPLBinauralEffect);
 static void (*p_iplBinauralEffectRelease)(IPLBinauralEffect *);
 
 static pthread_once_t phonon_once = PTHREAD_ONCE_INIT;
@@ -159,6 +159,11 @@ static void phonon_load(void)
     LOAD_FUNC(iplBinauralEffectApply);
     LOAD_FUNC(iplBinauralEffectRelease);
 #undef LOAD_FUNC
+
+    /* Not in the list above, which fails the whole load on a missing symbol:
+     * without it the tail countdown falls back to a fixed two blocks. */
+    p_iplBinauralEffectGetTailSize = dlsym(phonon_handle, "iplBinauralEffectGetTailSize");
+
     return;
 
 fail:
@@ -178,7 +183,9 @@ struct spatial_engine
     IPLHRTF hrtf;
     IPLAudioSettings audio;
     IPLBinauralEffect effects[SPATIAL_MAX_SLOTS];
-    unsigned char tail_pending[SPATIAL_MAX_SLOTS]; /* skipping a live tail clicks */
+    /* per-slot count of silent blocks still to convolve; skipping a live tail clicks */
+    unsigned char tail_pending[SPATIAL_MAX_SLOTS];
+    unsigned char tail_blocks;  /* tail_pending reload, 0 until libphonon can report it */
     float *scratch;     /* 2 * frames, deinterleaved L then R */
     int bass_on;        /* WINE_SPATIAL_BASS one-pole low-shelf active */
     float bass_g;       /* LF gain, 0..1 (1 = unchanged) */
@@ -360,6 +367,26 @@ static int buffer_is_silent(const float *p, UINT frames)
     return 1;
 }
 
+/* The shipped libphonon returns TAILREMAINING from every iplBinauralEffectApply,
+ * measured over 100000 consecutive silent blocks at 480 and at 1024 frames, so
+ * its return state can never end a tail and the count has to come from
+ * iplBinauralEffectGetTailSize: 544 samples at a 480-frame period, 1024 at 1024.
+ * ceil(544 / 480) = 2 matches the measured residual after the last live block,
+ * -4.9 dB in the first silent block and -145 dB in the second, so 2 is also the
+ * fallback when no size can be had. */
+#define SPATIAL_TAIL_BLOCKS 2
+
+static unsigned char tail_block_count(IPLBinauralEffect effect, int frames)
+{
+    int tail;
+
+    if (!p_iplBinauralEffectGetTailSize) return SPATIAL_TAIL_BLOCKS;
+    tail = p_iplBinauralEffectGetTailSize(effect);
+    /* the countdown is one byte per slot, and 255 blocks is not an HRTF tail */
+    if (tail <= 0 || tail / frames > 254) return SPATIAL_TAIL_BLOCKS;
+    return (tail + frames - 1) / frames;
+}
+
 static NTSTATUS spatial_mix(void *args)
 {
     struct spatial_mix_params *params = args;
@@ -380,7 +407,7 @@ static NTSTATUS spatial_mix(void *args)
         float *in_data = (float *)(UINT_PTR)objs[i].buffer;
         float *out_data[2];
         float len;
-        int silent, state;
+        int silent;
 
         if (objs[i].slot >= SPATIAL_MAX_SLOTS || !engine->effects[objs[i].slot])
             continue;
@@ -421,9 +448,18 @@ static NTSTATUS spatial_mix(void *args)
         out.numSamples = params->frames;
         out.data = out_data;
 
-        state = p_iplBinauralEffectApply(engine->effects[objs[i].slot], &effect_params, &in, &out);
-        engine->tail_pending[objs[i].slot] =
-                !silent || state != IPL_AUDIOEFFECTSTATE_TAILCOMPLETE;
+        p_iplBinauralEffectApply(engine->effects[objs[i].slot], &effect_params, &in, &out);
+        if (silent)
+            engine->tail_pending[objs[i].slot]--;
+        else
+        {
+            /* the size reads 0 until the effect has convolved a block, so it
+             * cannot be asked for at spatial_object_add time */
+            if (!engine->tail_blocks)
+                engine->tail_blocks = tail_block_count(engine->effects[objs[i].slot],
+                                                       engine->audio.frameSize);
+            engine->tail_pending[objs[i].slot] = engine->tail_blocks;
+        }
 
         for (f = 0; f < params->frames; f++)
         {
