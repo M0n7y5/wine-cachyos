@@ -497,6 +497,11 @@ static NTSTATUS spatial_mix(void *args)
  * creation.  Announce arrives from any activating thread, hence the once. */
 static struct pwhud_snapshot *hud_snap;
 static int hud_state;   /* 0 untried, 1 mapped, -1 unavailable */
+/* Whether the writer that created this page declared it wide enough to hold
+ * the clip counters.  A newer mmdevapi against an older driver's page must
+ * write only the fields that page has, which is the same append rule the
+ * size check above enforces in the other direction. */
+static int hud_has_clip;
 static pthread_once_t hud_once = PTHREAD_ONCE_INIT;
 
 static void hud_map_once(void)
@@ -541,6 +546,7 @@ static void hud_map_once(void)
         WARN("cannot lock the snapshot page (%s); a publish may fault\n", strerror(errno));
 
     hud_snap = snap;
+    hud_has_clip = snap->size >= PWHUD_SIZE_V1_CLIP;
     hud_state = 1;
     TRACE("publishing section B into %s\n", path);
 }
@@ -588,6 +594,16 @@ static NTSTATUS spatial_hud_publish(void *args)
         snap->sp_dyn_max = params->dyn_max;
         for (i = 0; i < PWHUD_BED_MAX; i++)
             snap->sp_bed_db[i] = params->bed_db[i];
+        if (hud_has_clip)
+        {
+            snap->sp_clip_samples = params->clip_samples;
+            snap->sp_clip_total = params->clip_total;
+            snap->sp_clip_passes = params->clip_passes;
+            snap->sp_bus_passes = params->bus_passes;
+            snap->sp_clip_engagements = params->clip_engagements;
+            snap->sp_clip_nonfinite = params->clip_nonfinite;
+            snap->sp_clip_peak_db = params->clip_peak_db;
+        }
         snap->sp_publishes++;
         /* Inside seqlock B, so this bit is validated by seq_sp for a reader
          * that takes it from the section B copy.  Section A's bits are

@@ -74,12 +74,19 @@ struct spatial_mix_params
     UINT64 out_r;
 };
 
-/* Section B of the shared diagnostic snapshot.  Scalars only, all 4-byte, so
- * the layout is identical for 32- and 64-bit callers without any explicit
- * padding.  SPATIAL_BED_MAX and SPATIAL_DB_FLOOR are asserted against the
- * snapshot's own PWHUD_BED_MAX and PWHUD_DB_FLOOR in unix/spatial.c, which is
- * the one file that knows both, so this header stays independent of the
- * driver's. */
+/* Section B of the shared diagnostic snapshot.  SPATIAL_BED_MAX and
+ * SPATIAL_DB_FLOOR are asserted against the snapshot's own PWHUD_BED_MAX and
+ * PWHUD_DB_FLOOR in unix/spatial.c, which is the one file that knows both, so
+ * this header stays independent of the driver's.
+ *
+ * The layout must be identical for 32- and 64-bit callers, which was free
+ * while every field was 4 bytes.  The clip totals are 64-bit because their
+ * denominator counts every bus sample and a 32-bit one wraps after 12 hours
+ * of stereo at 48 kHz, so they sit at offsets divisible by 8 and the struct
+ * carries an explicit tail pad: the System V i386 ABI aligns UINT64 to 4 and
+ * x86_64 aligns it to 8, so only offsets that satisfy both agree.  The
+ * offsets below are asserted rather than trusted.  Same rule as the
+ * snapshot's own header, which has carried mixed widths from the start. */
 #define SPATIAL_BED_MAX  18
 #define SPATIAL_DB_FLOOR (-120.0f)
 
@@ -97,9 +104,22 @@ struct spatial_hud_params
     UINT announce;
     UINT enabled;             /* out: 0 = no snapshot in this process, stop calling */
     float bed_db[SPATIAL_BED_MAX];
+    /* Cumulative for the life of the publishing stream, so a lost publish
+     * costs freshness and never a count, and the value in the snapshot is
+     * always some stream's own total rather than a sum across streams. */
+    UINT64 clip_samples;
+    UINT64 clip_total;
+    UINT clip_passes;
+    UINT bus_passes;
+    UINT clip_engagements;
+    UINT clip_nonfinite;
+    float clip_peak_db;       /* dB above full scale; exactly 0.0 = never over */
+    UINT pad;                 /* holds the size equal on both arches; unused */
 };
 
-C_ASSERT(sizeof(struct spatial_hud_params) == 104);
+C_ASSERT(sizeof(struct spatial_hud_params) == 144);
+C_ASSERT(offsetof(struct spatial_hud_params, clip_samples) == 104);
+C_ASSERT(offsetof(struct spatial_hud_params, clip_total) == 112);
 
 enum spatial_unix_func
 {

@@ -303,6 +303,17 @@ struct SpatialAudioStreamImpl {
     UINT64 engine;
     float *hrtf_buf;
 
+    /* Bus clip accounting, published in section B.  Cumulative for the life of
+     * the stream and deliberately not cleared by SAORS_Reset: they describe
+     * what this stream did to the audio, and a title that stops and restarts
+     * has not undone it.  clip_peak is a linear magnitude so the sample loop
+     * stays free of a log; the conversion to dB happens once per publish.
+     * clip_engaged is the edge detector behind clip_engagements. */
+    UINT64 clip_samples, clip_total;
+    UINT32 clip_passes, bus_passes, clip_engagements, clip_nonfinite;
+    float clip_peak;
+    BOOL clip_engaged;
+
     struct list objects;
 };
 
@@ -1036,6 +1047,18 @@ static void spatial_hud_update(SpatialAudioStreamImpl *stream)
     hud.dyn_live = stream->dyn_live;
     hud.dyn_max = stream->dyn_max;
     hud.announce = 0;
+    hud.clip_samples = stream->clip_samples;
+    hud.clip_total = stream->clip_total;
+    hud.clip_passes = stream->clip_passes;
+    hud.bus_passes = stream->bus_passes;
+    hud.clip_engagements = stream->clip_engagements;
+    hud.clip_nonfinite = stream->clip_nonfinite;
+    /* One log per publish, off the sample loop.  Exactly 0.0 has to mean
+     * "never over", so a peak that never reached full scale must not fall
+     * through log10 and land on a small negative. */
+    hud.clip_peak_db = stream->clip_peak > 1.0f ?
+            (float)(20.0 * log10(stream->clip_peak)) : 0.0f;
+    hud.pad = 0;
 
     /* Activation has already initialised the unixlib for every stream
      * that reaches here, so this is a cached flag read.  It stays to hold
@@ -1179,6 +1202,8 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
          * far over full scale clean. */
         if(bus_dirty){
             UINT32 nch = This->stream_fmtex.Format.nChannels;
+            UINT32 clipped = 0, nonfinite = 0;
+            float worst = 0.0f;
 
             for(i = 0; i < This->update_frames; ++i){
                 float *l = &This->buf[i * nch + This->dyn_left];
@@ -1188,12 +1213,36 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
                  * is fminf(fmaxf(v, low), high), whose fmaxf returns low for a
                  * NaN, so an unguarded one leaves here and arrives at the
                  * endpoint as full-scale negative.  Zero, not a rail: a rail
-                 * is the loudest possible wrong answer. */
-                if(!isfinite(*l)) *l = 0.0f;
-                else if(*l > 1.0f) *l = 1.0f; else if(*l < -1.0f) *l = -1.0f;
-                if(!isfinite(*r)) *r = 0.0f;
-                else if(*r > 1.0f) *r = 1.0f; else if(*r < -1.0f) *r = -1.0f;
+                 * is the loudest possible wrong answer.
+                 *
+                 * The counters ride branches that already exist, so a sample
+                 * inside full scale costs exactly what it did before. */
+                if(!isfinite(*l)){ *l = 0.0f; nonfinite++; }
+                else if(*l > 1.0f){ if(*l > worst) worst = *l; *l = 1.0f; clipped++; }
+                else if(*l < -1.0f){ if(-*l > worst) worst = -*l; *l = -1.0f; clipped++; }
+                if(!isfinite(*r)){ *r = 0.0f; nonfinite++; }
+                else if(*r > 1.0f){ if(*r > worst) worst = *r; *r = 1.0f; clipped++; }
+                else if(*r < -1.0f){ if(-*r > worst) worst = -*r; *r = -1.0f; clipped++; }
             }
+
+            /* Two bus channels, so the denominator is twice the frames: the
+             * published ratio is of samples the clip could have truncated and
+             * not of the whole stream, which would flatter us by the bed
+             * width. */
+            This->clip_total += (UINT64)This->update_frames * 2;
+            This->clip_samples += clipped;
+            This->clip_nonfinite += nonfinite;
+            This->bus_passes++;
+            if(clipped){
+                This->clip_passes++;
+                if(!This->clip_engaged) This->clip_engagements++;
+            }
+            This->clip_engaged = clipped != 0;
+            if(worst > This->clip_peak) This->clip_peak = worst;
+        }else{
+            /* Nothing on the bus ends an engagement rather than suspending it,
+             * so a burst either side of a silent gap counts as two. */
+            This->clip_engaged = FALSE;
         }
         spatial_hud_update(This);
 

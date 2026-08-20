@@ -88,6 +88,10 @@
  * tests size against this, not against sizeof. */
 #define PWHUD_SIZE_V1_STR 584u
 
+/* First size that includes the section B clip counters.  Same rule: gate on
+ * this, not on sizeof, so a new reader still works against an old writer. */
+#define PWHUD_SIZE_V1_CLIP 624u
+
 /* $HOME is bind-mounted into the Steam pressure-vessel container at the same
  * path; $XDG_RUNTIME_DIR is reconstructed there with only selected sockets
  * bound in, so it is not a shared drop point.  The pid disambiguates the
@@ -260,10 +264,51 @@ struct pwhud_snapshot
     uint32_t drv_str_count;
     uint32_t drv_str_pad;        /* keeps drv_str 8-aligned; unused */
     struct pwhud_str drv_str[PWHUD_STR_MAX];
+
+    /* Truncation accounting for the bus clip, section B, appended 2026-08-20.
+     * Cumulative over the elected stream's life and never reset, so a reader
+     * samples them at any two instants and subtracts.
+     *
+     * They exist because the clip is the one stage in our mixer that changes
+     * samples irreversibly, and it did so with no instrument: a user report of
+     * harshness could not be separated from a title that simply mixes hot.
+     * Windows reports clipping nowhere, so this is a place where we can be
+     * better than the reference rather than merely match it.
+     *
+     * sp_clip_total is the denominator sp_clip_samples needs and it counts
+     * samples the clip examined, which is bus channels only, so the ratio is
+     * "of the samples that could have been truncated" and not "of the stream".
+     * sp_bus_passes is the same service for sp_clip_passes: passes in which
+     * the clip ran at all, which is the ones with something on the bus.
+     *
+     * sp_clip_engagements counts clean-to-clipping transitions, not passes,
+     * because that is the quantity the limiter question turns on: duty and
+     * modulation rate move in opposite directions with release time, and the
+     * audible artefact tracks the rate.  A pass with nothing on the bus ends
+     * an engagement, since there is no signal left to hold.
+     *
+     * sp_clip_nonfinite counts samples sent to zero by the non-finite guard.
+     * Separate from sp_clip_samples on purpose: mixing them would make the
+     * truncation ratio ambiguous, and a NaN reaching the bus is a different
+     * fault with a different cause.  Without it that guard is invisible in
+     * the field.
+     *
+     * sp_clip_peak_db is dB above full scale, worst sample magnitude before
+     * truncation, and exactly 0.0 means nothing ever exceeded full scale.
+     * Published as dB rather than a ratio because the log runs once per
+     * publish on the PE side and never in the sample loop. */
+    uint64_t sp_clip_samples;
+    uint64_t sp_clip_total;
+    uint32_t sp_clip_passes;
+    uint32_t sp_bus_passes;
+    uint32_t sp_clip_engagements;
+    uint32_t sp_clip_nonfinite;
+    float    sp_clip_peak_db;
+    uint32_t sp_clip_pad;        /* keeps the struct 8-aligned; unused */
 };
 
 C_ASSERT(sizeof(struct pwhud_str) == 40);
-C_ASSERT(sizeof(struct pwhud_snapshot) == 584);
+C_ASSERT(sizeof(struct pwhud_snapshot) == 624);
 C_ASSERT(sizeof(struct pwhud_snapshot) <= PWHUD_BYTES);
 C_ASSERT(sizeof(struct pwhud_snapshot) % 8 == 0);
 C_ASSERT(sizeof(float) == 4);
@@ -312,6 +357,13 @@ C_ASSERT(offsetof(struct pwhud_snapshot, drv_str)             == 264);
 C_ASSERT(offsetof(struct pwhud_snapshot, drv_str[0].id)       == 264);
 C_ASSERT(offsetof(struct pwhud_snapshot, drv_str[0].channels) == 268);
 C_ASSERT(offsetof(struct pwhud_snapshot, drv_str[0].peak_db)  == 272);
+C_ASSERT(offsetof(struct pwhud_snapshot, sp_clip_samples)     == 584);
+C_ASSERT(offsetof(struct pwhud_snapshot, sp_clip_total)       == 592);
+C_ASSERT(offsetof(struct pwhud_snapshot, sp_clip_passes)      == 600);
+C_ASSERT(offsetof(struct pwhud_snapshot, sp_bus_passes)       == 604);
+C_ASSERT(offsetof(struct pwhud_snapshot, sp_clip_engagements) == 608);
+C_ASSERT(offsetof(struct pwhud_snapshot, sp_clip_nonfinite)   == 612);
+C_ASSERT(offsetof(struct pwhud_snapshot, sp_clip_peak_db)     == 616);
 /* The baseline is exactly the end of sp_bed_db.  Pinned, because a reader
  * validating against it would otherwise be trusting a number that could drift
  * away from the last field an old writer actually wrote. */
@@ -321,6 +373,9 @@ C_ASSERT(PWHUD_SIZE_V1_BASE <= sizeof(struct pwhud_snapshot));
 C_ASSERT(PWHUD_SIZE_V1_STR == offsetof(struct pwhud_snapshot, drv_str) +
                              sizeof(((struct pwhud_snapshot *)0)->drv_str));
 C_ASSERT(PWHUD_SIZE_V1_STR <= sizeof(struct pwhud_snapshot));
+C_ASSERT(PWHUD_SIZE_V1_CLIP == offsetof(struct pwhud_snapshot, sp_clip_pad) +
+                               sizeof(((struct pwhud_snapshot *)0)->sp_clip_pad));
+C_ASSERT(PWHUD_SIZE_V1_CLIP <= sizeof(struct pwhud_snapshot));
 
 /* Replace this publisher's bits and leave the other side's untouched.  A
  * compare-exchange loop, not fetch-and followed by fetch-or: that pair leaves a
