@@ -835,7 +835,7 @@ static void build_format(WAVEFORMATEXTENSIBLE *fmt, uint32_t rate, uint32_t chan
  * frees it on failure. */
 static struct pw_phys_device *add_device(struct list *list, const char *pw_name, WCHAR *display,
                                          EndpointFormFactor form, uint32_t rate, uint32_t channels, UINT mask,
-                                         REFERENCE_TIME min_period)
+                                         REFERENCE_TIME def_period, REFERENCE_TIME min_period)
 {
     size_t len = strlen(pw_name);
     struct pw_phys_device *dev;
@@ -851,7 +851,7 @@ static struct pw_phys_device *add_device(struct list *list, const char *pw_name,
     dev->form = form;
     build_format(&dev->fmt, rate, channels, mask);
     dev->channel_mask = dev->fmt.dwChannelMask;
-    dev->def_period = 100000;
+    dev->def_period = def_period;
     dev->min_period = min_period;
     memcpy(dev->pw_name, pw_name, len + 1);
     list_add_tail(list, &dev->entry);
@@ -1726,7 +1726,8 @@ static void probe_roundtrip(struct probe *p)
  * routing).  When the default node is known, mirror its format so the
  * default endpoint advertises the real speaker layout. */
 static void add_default_device(struct list *list, EndpointFormFactor form, const char *match,
-                               uint32_t rate, REFERENCE_TIME min_period, UINT index)
+                               uint32_t rate, REFERENCE_TIME def_period,
+                               REFERENCE_TIME min_period, UINT index)
 {
     struct pw_phys_device *dev, *def_src = NULL, *def;
 
@@ -1750,7 +1751,7 @@ static void add_default_device(struct list *list, EndpointFormFactor form, const
     def->pw_name[0] = '\0';
     def->form = form;
     def->index = index;
-    def->def_period = 100000;
+    def->def_period = def_period;
     def->min_period = min_period;
     if (def_src)
     {
@@ -1824,7 +1825,7 @@ static void build_device_cache(struct probe *p)
 {
     struct probe_node *pn;
     uint32_t rate = p->clock_rate ? p->clock_rate : 48000;
-    REFERENCE_TIME min_period = 30000;
+    REFERENCE_TIME min_period = 30000, def_period = 100000;
     UINT index = 0;
 
     /* IAudioClient3 shared-mode floor.  clock.force-quantum pins the graph
@@ -1841,6 +1842,12 @@ static void build_device_cache(struct probe *p)
         min_period = (REFERENCE_TIME)p->force_quantum * 10000000 / rate;
         TRACE("force_quantum=%u rate=%u -> min_period=%d hns\n",
               p->force_quantum, rate, (int)min_period);
+        /* A 10 ms default on a graph pinned longer than that makes every
+         * shared-mode client wake twice per cycle for one cycle of work.
+         * mmdevapi floors this at 10 ms (client.c:113), so a pinned quantum
+         * shorter than 10 ms lands back on the default and only a longer one
+         * moves it. */
+        def_period = min_period;
     }
     else if (p->min_quantum)
     {
@@ -1866,7 +1873,8 @@ static void build_device_cache(struct probe *p)
         struct pw_phys_device *dev;
         WCHAR *name = utf8_to_wstr_capped(pn->display, pn->nick, pn->node_name);
 
-        dev = add_device(list, pn->node_name, name, form, rate, channels, mask, min_period);
+        dev = add_device(list, pn->node_name, name, form, rate, channels, mask,
+                         def_period, min_period);
         fill_device_path_info(dev, p, pn, index++);
 
         /* PipeWire has no separate monitor nodes, so synthesize one capture
@@ -1880,14 +1888,17 @@ static void build_device_cache(struct probe *p)
             if (mon)
             {
                 struct pw_phys_device *md = add_device(&g_capture_devices, pn->node_name, mon,
-                                                       LineLevel, rate, channels, mask, min_period);
+                                                       LineLevel, rate, channels, mask,
+                                                       def_period, min_period);
                 fill_device_path_info(md, p, pn, index++);
             }
         }
     }
 
-    add_default_device(&g_render_devices, Speakers, g_default_sink, rate, min_period, index++);
-    add_default_device(&g_capture_devices, Microphone, g_default_source, rate, min_period, index++);
+    add_default_device(&g_render_devices, Speakers, g_default_sink, rate, def_period,
+                       min_period, index++);
+    add_default_device(&g_capture_devices, Microphone, g_default_source, rate, def_period,
+                       min_period, index++);
 }
 
 static void probe_teardown(struct probe *p)
