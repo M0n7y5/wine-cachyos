@@ -3913,10 +3913,16 @@ static void pipewire_period_timer_loop(void *args)
         INT64 adjust = 0;
         UINT64 mono_ns = 0;
         int have_now = 0, have_time = 0;
-        float hud_peak[PWHUD_OUT_MAX] = { 0.0f };
+        float hud_peak[PWHUD_OUT_MAX];
         struct pwhud_str hud_str[PWHUD_STR_MAX];
-        UINT32 hud_channels = 0, hud_out_flags = 0, hud_str_count = 0;
+        UINT32 hud_channels = 0, hud_out_flags = 0, hud_str_count = 0, hud_seed;
         BOOL hud_publishing = FALSE;
+
+        /* The floor and not zero, which is 0 dBFS: these are decibels and the group
+         * fold keeps the larger value, so a zeroed seed would out-rank every real
+         * level and publish full scale on silence. */
+        for (hud_seed = 0; hud_seed < PWHUD_OUT_MAX; hud_seed++)
+            hud_peak[hud_seed] = PWHUD_DB_FLOOR;
 
         NtDelayExecution(FALSE, &delay);
 
@@ -4033,30 +4039,39 @@ static void pipewire_period_timer_loop(void *args)
 
                 if (hud_publishing)
                 {
+                    UINT32 str_flags = 0, ch, c;
+                    float spill[PWHUD_OUT_MAX];
+                    float *dst = spill;
+
                     if (hud_str_count < PWHUD_STR_MAX)
                     {
-                        UINT32 str_flags = 0, c;
-
                         hud_str[hud_str_count].id = stream->hud_id;
-                        hud_str[hud_str_count].channels =
-                            hud_render_peaks(stream, hud_str[hud_str_count].peak_db, &str_flags);
-                        for (c = hud_str[hud_str_count].channels; c < PWHUD_OUT_MAX; c++)
-                            hud_str[hud_str_count].peak_db[c] = PWHUD_DB_FLOOR;
-                        if (stream == period->timer_stream)
-                        {
-                            hud_channels = hud_str[hud_str_count].channels;
-                            hud_out_flags |= str_flags;
-                            for (c = 0; c < PWHUD_OUT_MAX; c++)
-                                hud_peak[c] = hud_str[hud_str_count].peak_db[c];
-                        }
-                        hud_str_count++;
+                        dst = hud_str[hud_str_count].peak_db;
                     }
                     else
-                    {
                         hud_out_flags |= PWHUD_F_STR_TRUNCATED;
-                        if (stream == period->timer_stream)
-                            hud_channels = hud_render_peaks(stream, hud_peak, &hud_out_flags);
-                    }
+
+                    ch = hud_render_peaks(stream, dst, &str_flags);
+                    for (c = ch; c < PWHUD_OUT_MAX; c++)
+                        dst[c] = PWHUD_DB_FLOOR;
+                    if (hud_str_count < PWHUD_STR_MAX)
+                        hud_str[hud_str_count++].channels = ch;
+
+                    /* Section A carries the loudest of the group rather than the
+                     * elected stream's own level.  Metering one member and
+                     * publishing it as the driver is how a title whose elected
+                     * stream is permanently silent reads as silent for a whole
+                     * session: CP2077 published -120.0 dBFS on 351 of 351 samples
+                     * with every bit of its audio on the sibling stream.  Per
+                     * stream truth stays exact in drv_str[], and the max costs
+                     * nothing because each started render stream is already
+                     * scanned right here. */
+                    for (c = 0; c < ch; c++)
+                        if (dst[c] > hud_peak[c])
+                            hud_peak[c] = dst[c];
+                    if (ch > hud_channels)
+                        hud_channels = ch;
+                    hud_out_flags |= str_flags;
                 }
 
                 stream->lcl_offs_bytes += adv;

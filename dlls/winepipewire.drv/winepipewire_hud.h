@@ -62,6 +62,17 @@
  * the negotiated PipeWire format, not spatial bed channels: those are
  * sp_bed_db[PWHUD_BED_MAX], written by the other publisher.
  *
+ * out_peak_db is the per-channel MAXIMUM over every started render stream in
+ * the elected period group, not the elected stream's own level, and
+ * out_channels is the widest metered count among them.  It used to be the
+ * elected stream alone, which published silence for entire sessions: a title
+ * whose elected stream is permanently quiet read -120.0 dBFS while all of its
+ * audio played on a sibling in the same group.  Per stream levels are exact in
+ * drv_str[], so nothing is lost by aggregating here.  A consequence for
+ * readers: PWHUD_F_OUT_NO_METER and PWHUD_F_OUT_TRUNCATED are now the OR over
+ * that set, so either bit means at least one stream is affected and the
+ * maximum may understate the group, not that the number shown is unusable.
+ *
  * 8 is chosen, not assumed.  It covers stereo through 7.1, which is every
  * endpoint that occurs here, and the scan is O(frames x channels) so raising
  * it would double the worst-case tick cost for a configuration nobody has.
@@ -258,9 +269,9 @@ struct pwhud_snapshot
     uint32_t sp_clients;
     uint32_t sp_publishes;
 
-    /* Per-stream meters, section A.  out_peak_db stays the elected stream so
-     * existing readers are unchanged.  Only the elected group's started
-     * render streams; other groups are outside this writer. */
+    /* Per-stream meters, section A, and the exact levels behind the group
+     * maximum in out_peak_db.  Only the elected group's started render
+     * streams; other groups are outside this writer. */
     uint32_t drv_str_count;
     uint32_t drv_str_pad;        /* keeps drv_str 8-aligned; unused */
     struct pwhud_str drv_str[PWHUD_STR_MAX];
