@@ -844,7 +844,13 @@ static HRESULT WINAPI SAORS_BeginUpdatingAudioObjects(ISpatialAudioObjectRenderS
         }
 
         LIST_FOR_EACH_ENTRY(object, &This->objects, SpatialAudioObjectImpl, entry){
-            memset(object->buf, 0, This->update_frames * This->sa_client->object_fmtex.Format.nBlockAlign);
+            /* An object that has never been written is still all zeroes: buf
+             * is calloc'd at activation and SAO_GetBuffer is its only writer.
+             * Clearing only the voices in use keeps a pre-activated pool off
+             * this loop. */
+            if(object->started)
+                memset(object->buf, 0, This->update_frames *
+                        This->sa_client->object_fmtex.Format.nBlockAlign);
             object->updated = FALSE;
         }
     }else if (!fixme_once){
